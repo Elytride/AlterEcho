@@ -5,44 +5,121 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Send, Paperclip, Mic, User, Phone, PhoneOff, Volume2, Eye } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { motion, AnimatePresence } from "framer-motion";
+import { sendMessage, getMessages } from "@/lib/api";
 
-export function ChatInterface() {
-    const [messages, setMessages] = useState([
-        {
-            id: 1,
-            role: "assistant",
-            content: "Hello. I am initialized with the cognitive patterns of Alan Turing. How may I assist in your computations today?",
-            timestamp: "10:23 AM"
-        }
-    ]);
+export function ChatInterface({ sessionId = "1", sessionName = "Alan Turing" }) {
+    const [messages, setMessages] = useState([]);
     const [input, setInput] = useState("");
     const [mode, setMode] = useState("text");
     const [isCallActive, setIsCallActive] = useState(false);
     const [callDuration, setCallDuration] = useState(0);
+    const [isLoading, setIsLoading] = useState(false);
+    const [isListening, setIsListening] = useState(false);
     const scrollRef = useRef(null);
+    const fileInputRef = useRef(null);
 
-    const handleSend = () => {
-        if (!input.trim()) return;
+    // Fetch messages on mount or session change
+    useEffect(() => {
+        async function fetchMessages() {
+            try {
+                const data = await getMessages(sessionId);
+                setMessages(data.messages || []);
+            } catch (error) {
+                console.error("Failed to fetch messages:", error);
+                // Fallback to default message
+                setMessages([{
+                    id: 1,
+                    role: "assistant",
+                    content: `Hello. I am initialized with the cognitive patterns of ${sessionName}. How may I assist in your computations today?`,
+                    timestamp: "10:23 AM"
+                }]);
+            }
+        }
+        fetchMessages();
+    }, [sessionId, sessionName]);
 
-        const newMsg = {
-            id: Date.now(),
+    const handleSend = async () => {
+        if (!input.trim() || isLoading) return;
+
+        const userContent = input;
+        setInput("");
+        setIsLoading(true);
+
+        // Optimistic update - add user message immediately
+        const tempUserMsg = {
+            id: `temp-${Date.now()}`,
             role: "user",
-            content: input,
+            content: userContent,
             timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
         };
+        setMessages(prev => [...prev, tempUserMsg]);
 
-        setMessages(prev => [...prev, newMsg]);
-        setInput("");
-
-        // Mock response
-        setTimeout(() => {
+        try {
+            const response = await sendMessage(userContent, sessionId);
+            // Replace temp message with real ones
+            setMessages(prev => {
+                const filtered = prev.filter(m => m.id !== tempUserMsg.id);
+                return [...filtered, response.user_message, response.ai_message];
+            });
+        } catch (error) {
+            console.error("Failed to send message:", error);
+            // Keep the temp message but show error
             setMessages(prev => [...prev, {
                 id: Date.now() + 1,
                 role: "assistant",
-                content: "That is a fascinating query. It reminds me of the halting problem...",
+                content: "I apologize, but I'm having trouble processing your request. Please try again.",
                 timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
             }]);
-        }, 1500);
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    const handleAttachment = () => {
+        fileInputRef.current?.click();
+    };
+
+    const handleFileSelect = async (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+
+        // Add a message about the attached file
+        setMessages(prev => [...prev, {
+            id: Date.now(),
+            role: "user",
+            content: `📎 Attached: ${file.name}`,
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        }]);
+
+        // Reset input
+        e.target.value = '';
+    };
+
+    const handleMicClick = () => {
+        if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+            alert("Speech recognition is not supported in this browser.");
+            return;
+        }
+
+        if (isListening) {
+            setIsListening(false);
+            return;
+        }
+
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        const recognition = new SpeechRecognition();
+        recognition.continuous = false;
+        recognition.interimResults = false;
+
+        recognition.onstart = () => setIsListening(true);
+        recognition.onend = () => setIsListening(false);
+        recognition.onresult = (event) => {
+            const transcript = event.results[0][0].transcript;
+            setInput(prev => prev + transcript);
+        };
+        recognition.onerror = () => setIsListening(false);
+
+        recognition.start();
     };
 
     // Call duration timer
@@ -70,6 +147,15 @@ export function ChatInterface() {
 
     return (
         <div className="flex-1 flex flex-col h-full bg-background relative overflow-hidden">
+            {/* Hidden file input */}
+            <input
+                type="file"
+                ref={fileInputRef}
+                onChange={handleFileSelect}
+                className="hidden"
+                accept=".txt,.pdf,.json,.doc,.docx"
+            />
+
             {/* Background Ambience */}
             <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_120%,rgba(120,58,237,0.1),transparent_50%)] pointer-events-none" />
 
@@ -81,7 +167,7 @@ export function ChatInterface() {
                         isCallActive && mode === "call" ? "bg-red-500" : "bg-green-500"
                     )} />
                     <div className="flex flex-col min-w-0">
-                        <span className="font-display font-medium text-white text-sm sm:text-base truncate">Alan Turing</span>
+                        <span className="font-display font-medium text-white text-sm sm:text-base truncate">{sessionName}</span>
                         <span className="text-[10px] sm:text-xs text-muted-foreground truncate">
                             {isCallActive && mode === "call" ? `Call • ${formatDuration(callDuration)}` : "Online • v2.4"}
                         </span>
@@ -163,6 +249,20 @@ export function ChatInterface() {
                                         </div>
                                     </div>
                                 ))}
+                                {isLoading && (
+                                    <div className="flex gap-2 sm:gap-4">
+                                        <div className="w-6 h-6 sm:w-8 sm:h-8 rounded-full flex items-center justify-center shrink-0 border border-white/10 bg-primary/20 text-primary">
+                                            <CpuIcon size={14} />
+                                        </div>
+                                        <div className="p-3 sm:p-4 rounded-lg sm:rounded-2xl bg-white/5 border border-white/5 text-gray-200 rounded-tl-none">
+                                            <div className="flex gap-1">
+                                                <span className="w-2 h-2 bg-primary/50 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></span>
+                                                <span className="w-2 h-2 bg-primary/50 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></span>
+                                                <span className="w-2 h-2 bg-primary/50 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
                             </div>
                         </ScrollArea>
 
@@ -171,7 +271,12 @@ export function ChatInterface() {
                             <div className="max-w-2xl sm:max-w-3xl mx-auto relative group">
                                 <div className="absolute -inset-0.5 bg-gradient-to-r from-primary/20 to-blue-500/20 rounded-lg sm:rounded-2xl blur opacity-20 group-hover:opacity-40 transition duration-500" />
                                 <div className="relative bg-sidebar border border-white/10 rounded-lg sm:rounded-2xl p-1.5 sm:p-2 flex items-center gap-1 sm:gap-2 shadow-2xl">
-                                    <Button variant="ghost" size="icon" className="h-8 w-8 sm:h-10 sm:w-10 text-muted-foreground hover:text-white shrink-0 text-xs sm:text-base">
+                                    <Button
+                                        variant="ghost"
+                                        size="icon"
+                                        className="h-8 w-8 sm:h-10 sm:w-10 text-muted-foreground hover:text-white shrink-0 text-xs sm:text-base"
+                                        onClick={handleAttachment}
+                                    >
                                         <Paperclip size={16} className="sm:size-[20px]" />
                                     </Button>
 
@@ -181,9 +286,18 @@ export function ChatInterface() {
                                         onKeyDown={(e) => e.key === "Enter" && handleSend()}
                                         placeholder="Message..."
                                         className="flex-1 bg-transparent border-none focus-visible:ring-0 text-white placeholder:text-muted-foreground/50 h-10 sm:h-12 text-xs sm:text-base"
+                                        disabled={isLoading}
                                     />
 
-                                    <Button variant="ghost" size="icon" className="h-8 w-8 sm:h-10 sm:w-10 text-muted-foreground hover:text-white shrink-0 text-xs sm:text-base">
+                                    <Button
+                                        variant="ghost"
+                                        size="icon"
+                                        className={cn(
+                                            "h-8 w-8 sm:h-10 sm:w-10 shrink-0 text-xs sm:text-base transition-colors",
+                                            isListening ? "text-red-500 animate-pulse" : "text-muted-foreground hover:text-white"
+                                        )}
+                                        onClick={handleMicClick}
+                                    >
                                         <Mic size={16} className="sm:size-[20px]" />
                                     </Button>
 
@@ -191,6 +305,7 @@ export function ChatInterface() {
                                         onClick={handleSend}
                                         size="icon"
                                         className="bg-primary hover:bg-primary/90 text-white rounded-lg sm:rounded-xl shrink-0 h-8 w-8 sm:h-10 sm:w-10 shadow-[0_0_15px_rgba(124,58,237,0.3)]"
+                                        disabled={isLoading || !input.trim()}
                                     >
                                         <Send size={14} className="sm:size-[18px]" />
                                     </Button>
@@ -240,7 +355,7 @@ export function ChatInterface() {
                                 transition={{ delay: 0.3 }}
                                 className="text-center"
                             >
-                                <h2 className="text-2xl sm:text-3xl font-display font-bold text-white mb-1 sm:mb-2">Alan Turing</h2>
+                                <h2 className="text-2xl sm:text-3xl font-display font-bold text-white mb-1 sm:mb-2">{sessionName}</h2>
                                 <p className="text-xs sm:text-base text-muted-foreground">
                                     {isCallActive ? (
                                         <span className="text-primary font-mono font-medium">{formatDuration(callDuration)}</span>

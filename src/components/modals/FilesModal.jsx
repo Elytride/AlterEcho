@@ -1,33 +1,135 @@
-import { useState } from "react";
+import { useState, useRef, useCallback } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
-import { FileText, Video, Mic, Upload, RefreshCw } from "lucide-react";
+import { FileText, Video, Mic, Upload, RefreshCw, Check, X } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 import { motion, AnimatePresence } from "framer-motion";
+import { uploadFile, refreshAIMemory } from "@/lib/api";
+import { cn } from "@/lib/utils";
 
 export function FilesModal({ open, onOpenChange }) {
     const [isRefreshing, setIsRefreshing] = useState(false);
     const [progress, setProgress] = useState(0);
+    const [uploadedFiles, setUploadedFiles] = useState({ text: [], video: [], voice: [] });
+    const [uploading, setUploading] = useState(false);
+    const [uploadError, setUploadError] = useState(null);
 
-    const handleRefresh = () => {
+    const textInputRef = useRef(null);
+    const videoInputRef = useRef(null);
+    const voiceInputRef = useRef(null);
+
+    const handleRefresh = async () => {
         setIsRefreshing(true);
         setProgress(0);
 
-        // Simulate training progress
+        // Simulate progress while calling API
         const interval = setInterval(() => {
             setProgress(prev => {
-                if (prev >= 100) {
-                    clearInterval(interval);
-                    setTimeout(() => setIsRefreshing(false), 1000);
-                    return 100;
-                }
-                return prev + 2;
+                if (prev >= 90) return prev;
+                return prev + 10;
             });
-        }, 50);
+        }, 200);
+
+        try {
+            await refreshAIMemory();
+            setProgress(100);
+            setTimeout(() => setIsRefreshing(false), 1000);
+        } catch (error) {
+            console.error("Failed to refresh AI memory:", error);
+            setIsRefreshing(false);
+        } finally {
+            clearInterval(interval);
+        }
     };
+
+    const handleFileUpload = async (file, fileType) => {
+        setUploading(true);
+        setUploadError(null);
+
+        try {
+            const result = await uploadFile(file, fileType);
+            setUploadedFiles(prev => ({
+                ...prev,
+                [fileType]: [...prev[fileType], { name: file.name, savedAs: result.saved_as }]
+            }));
+        } catch (error) {
+            console.error("Failed to upload file:", error);
+            setUploadError(`Failed to upload ${file.name}`);
+        } finally {
+            setUploading(false);
+        }
+    };
+
+    const handleFileSelect = (e, fileType) => {
+        const file = e.target.files?.[0];
+        if (file) {
+            handleFileUpload(file, fileType);
+        }
+        e.target.value = '';
+    };
+
+    const handleDrop = useCallback((e, fileType) => {
+        e.preventDefault();
+        e.stopPropagation();
+
+        const file = e.dataTransfer.files?.[0];
+        if (file) {
+            handleFileUpload(file, fileType);
+        }
+    }, []);
+
+    const handleDragOver = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+    };
+
+    const UploadZone = ({ fileType, icon: Icon, title, accept, inputRef }) => (
+        <>
+            <input
+                type="file"
+                ref={inputRef}
+                onChange={(e) => handleFileSelect(e, fileType)}
+                className="hidden"
+                accept={accept}
+            />
+            <div
+                className="border-2 border-dashed border-white/10 rounded-lg p-8 flex flex-col items-center justify-center text-center hover:border-primary/50 hover:bg-primary/5 transition-colors cursor-pointer group"
+                onClick={() => inputRef.current?.click()}
+                onDrop={(e) => handleDrop(e, fileType)}
+                onDragOver={handleDragOver}
+            >
+                <div className={cn(
+                    "w-12 h-12 rounded-full bg-white/5 flex items-center justify-center mb-4 transition-colors",
+                    uploading ? "animate-pulse" : "group-hover:bg-primary/20 group-hover:text-primary"
+                )}>
+                    <Icon size={24} />
+                </div>
+                <p className="text-sm font-medium">{title}</p>
+                <p className="text-xs text-muted-foreground mt-1">
+                    {fileType === "text" ? "TXT, PDF, JSON supported" :
+                        fileType === "video" ? "MP4, MOV up to 500MB" :
+                            "MP3, WAV for voice synthesis"}
+                </p>
+                {uploading && <p className="text-xs text-primary mt-2">Uploading...</p>}
+            </div>
+
+            {/* Uploaded files list */}
+            {uploadedFiles[fileType].length > 0 && (
+                <div className="mt-4 space-y-2">
+                    <Label className="text-xs text-muted-foreground">Uploaded Files</Label>
+                    {uploadedFiles[fileType].map((file, idx) => (
+                        <div key={idx} className="flex items-center gap-2 text-xs bg-white/5 rounded p-2">
+                            <Check size={14} className="text-green-500" />
+                            <span className="truncate flex-1">{file.name}</span>
+                        </div>
+                    ))}
+                </div>
+            )}
+        </>
+    );
 
     return (
         <Dialog open={open} onOpenChange={onOpenChange}>
@@ -38,6 +140,13 @@ export function FilesModal({ open, onOpenChange }) {
                         Manage the data sources used to reconstruct the personality.
                     </DialogDescription>
                 </DialogHeader>
+
+                {uploadError && (
+                    <div className="flex items-center gap-2 p-3 bg-red-500/10 border border-red-500/20 rounded-lg text-red-400 text-sm">
+                        <X size={16} />
+                        {uploadError}
+                    </div>
+                )}
 
                 <div className="mt-6">
                     <Tabs defaultValue="text" className="w-full">
@@ -58,13 +167,13 @@ export function FilesModal({ open, onOpenChange }) {
 
                         <div className="p-6 border border-white/5 border-t-0 rounded-b-lg bg-black/20 min-h-[300px]">
                             <TabsContent value="text" className="space-y-4 mt-0">
-                                <div className="border-2 border-dashed border-white/10 rounded-lg p-8 flex flex-col items-center justify-center text-center hover:border-primary/50 hover:bg-primary/5 transition-colors cursor-pointer group">
-                                    <div className="w-12 h-12 rounded-full bg-white/5 flex items-center justify-center mb-4 group-hover:bg-primary/20 group-hover:text-primary transition-colors">
-                                        <Upload size={24} />
-                                    </div>
-                                    <p className="text-sm font-medium">Drop chat logs or text files here</p>
-                                    <p className="text-xs text-muted-foreground mt-1">TXT, PDF, JSON supported</p>
-                                </div>
+                                <UploadZone
+                                    fileType="text"
+                                    icon={Upload}
+                                    title="Drop chat logs or text files here"
+                                    accept=".txt,.pdf,.json,.doc,.docx"
+                                    inputRef={textInputRef}
+                                />
 
                                 <div className="space-y-3 pt-4">
                                     <Label>Additional Context</Label>
@@ -76,23 +185,23 @@ export function FilesModal({ open, onOpenChange }) {
                             </TabsContent>
 
                             <TabsContent value="video" className="mt-0">
-                                <div className="border-2 border-dashed border-white/10 rounded-lg p-12 flex flex-col items-center justify-center text-center hover:border-primary/50 hover:bg-primary/5 transition-colors cursor-pointer group h-[300px]">
-                                    <div className="w-12 h-12 rounded-full bg-white/5 flex items-center justify-center mb-4 group-hover:bg-primary/20 group-hover:text-primary transition-colors">
-                                        <Video size={24} />
-                                    </div>
-                                    <p className="text-sm font-medium">Upload interviews or vlogs</p>
-                                    <p className="text-xs text-muted-foreground mt-1">MP4, MOV up to 500MB</p>
-                                </div>
+                                <UploadZone
+                                    fileType="video"
+                                    icon={Video}
+                                    title="Upload interviews or vlogs"
+                                    accept=".mp4,.mov,.avi,.webm"
+                                    inputRef={videoInputRef}
+                                />
                             </TabsContent>
 
                             <TabsContent value="voice" className="mt-0">
-                                <div className="border-2 border-dashed border-white/10 rounded-lg p-12 flex flex-col items-center justify-center text-center hover:border-primary/50 hover:bg-primary/5 transition-colors cursor-pointer group h-[300px]">
-                                    <div className="w-12 h-12 rounded-full bg-white/5 flex items-center justify-center mb-4 group-hover:bg-primary/20 group-hover:text-primary transition-colors">
-                                        <Mic size={24} />
-                                    </div>
-                                    <p className="text-sm font-medium">Upload voice notes or recordings</p>
-                                    <p className="text-xs text-muted-foreground mt-1">MP3, WAV for voice synthesis</p>
-                                </div>
+                                <UploadZone
+                                    fileType="voice"
+                                    icon={Mic}
+                                    title="Upload voice notes or recordings"
+                                    accept=".mp3,.wav,.ogg,.m4a"
+                                    inputRef={voiceInputRef}
+                                />
                             </TabsContent>
                         </div>
                     </Tabs>

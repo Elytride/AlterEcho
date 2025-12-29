@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
@@ -23,12 +23,7 @@ import {
     CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
-
-const MOCK_SESSIONS = [
-    { id: 1, name: "Alan Turing", preview: "The imitation game is..." },
-    { id: 2, name: "Ada Lovelace", preview: "Calculating the numbers..." },
-    { id: 3, name: "Marcus Aurelius", preview: "The obstacle is the way." },
-];
+import { getSessions, createSession, deleteSession } from "@/lib/api";
 
 const FAQ_ITEMS = [
     {
@@ -53,9 +48,82 @@ const FAQ_ITEMS = [
     }
 ];
 
-export function Sidebar({ onOpenFiles, onOpenSettings }) {
-    const [activeSession, setActiveSession] = useState(1);
+export function Sidebar({ onOpenFiles, onOpenSettings, onSessionChange }) {
+    const [sessions, setSessions] = useState([]);
+    const [activeSession, setActiveSession] = useState(null);
     const [faqOpen, setFaqOpen] = useState(false);
+    const [isLoading, setIsLoading] = useState(true);
+
+    // Fetch sessions on mount
+    useEffect(() => {
+        async function fetchSessions() {
+            try {
+                const data = await getSessions();
+                setSessions(data.sessions || []);
+                if (data.sessions?.length > 0 && !activeSession) {
+                    setActiveSession(data.sessions[0].id);
+                    onSessionChange?.(data.sessions[0]);
+                }
+            } catch (error) {
+                console.error("Failed to fetch sessions:", error);
+                // Fallback to mock data
+                const fallback = [
+                    { id: "1", name: "Alan Turing", preview: "The imitation game is..." },
+                    { id: "2", name: "Ada Lovelace", preview: "Calculating the numbers..." },
+                    { id: "3", name: "Marcus Aurelius", preview: "The obstacle is the way." },
+                ];
+                setSessions(fallback);
+                setActiveSession("1");
+                onSessionChange?.(fallback[0]);
+            } finally {
+                setIsLoading(false);
+            }
+        }
+        fetchSessions();
+    }, []);
+
+    const handleNewNull = async () => {
+        const name = prompt("Enter a name for the new Null personality:");
+        if (!name) return;
+
+        try {
+            const newSession = await createSession(name);
+            setSessions(prev => [...prev, newSession]);
+            setActiveSession(newSession.id);
+            onSessionChange?.(newSession);
+        } catch (error) {
+            console.error("Failed to create session:", error);
+            alert("Failed to create new session. Please try again.");
+        }
+    };
+
+    const handleDeleteSession = async (sessionId, e) => {
+        e.stopPropagation();
+
+        if (!confirm("Are you sure you want to delete this session?")) return;
+
+        try {
+            await deleteSession(sessionId);
+            setSessions(prev => prev.filter(s => s.id !== sessionId));
+
+            // If deleted active session, switch to first available
+            if (activeSession === sessionId && sessions.length > 1) {
+                const remaining = sessions.filter(s => s.id !== sessionId);
+                if (remaining.length > 0) {
+                    setActiveSession(remaining[0].id);
+                    onSessionChange?.(remaining[0]);
+                }
+            }
+        } catch (error) {
+            console.error("Failed to delete session:", error);
+            alert("Failed to delete session. Please try again.");
+        }
+    };
+
+    const handleSessionClick = (session) => {
+        setActiveSession(session.id);
+        onSessionChange?.(session);
+    };
 
     return (
         <div className="w-80 h-full bg-sidebar border-r border-white/5 flex flex-col font-sans">
@@ -70,6 +138,7 @@ export function Sidebar({ onOpenFiles, onOpenSettings }) {
                 <Button
                     className="w-full justify-start gap-2 bg-white/5 hover:bg-white/10 text-white border-white/5 mb-6"
                     variant="outline"
+                    onClick={handleNewNull}
                 >
                     <Plus size={16} />
                     New Null
@@ -82,50 +151,57 @@ export function Sidebar({ onOpenFiles, onOpenSettings }) {
 
             <ScrollArea className="flex-1 px-4">
                 <div className="space-y-2">
-                    {MOCK_SESSIONS.map((session) => (
-                        <div
-                            key={session.id}
-                            className={cn(
-                                "group flex items-center justify-between p-3 rounded-xl transition-all duration-200 cursor-pointer border",
-                                activeSession === session.id
-                                    ? "bg-primary/10 border-primary/20"
-                                    : "hover:bg-white/5 border-transparent hover:border-white/5"
-                            )}
-                            onClick={() => setActiveSession(session.id)}
-                        >
-                            <div className="flex items-center gap-3 overflow-hidden">
-                                <div className={cn(
-                                    "w-2 h-2 rounded-full",
-                                    activeSession === session.id ? "bg-primary shadow-[0_0_8px_rgba(124,58,237,0.5)]" : "bg-muted-foreground/30"
-                                )} />
-                                <div className="flex flex-col overflow-hidden">
-                                    <span className={cn(
-                                        "text-sm font-medium truncate",
-                                        activeSession === session.id ? "text-white" : "text-muted-foreground group-hover:text-white"
-                                    )}>
-                                        {session.name}
-                                    </span>
-                                    <span className="text-xs text-muted-foreground truncate opacity-60">
-                                        {session.preview}
-                                    </span>
+                    {isLoading ? (
+                        <div className="text-muted-foreground text-sm text-center py-4">Loading...</div>
+                    ) : (
+                        sessions.map((session) => (
+                            <div
+                                key={session.id}
+                                className={cn(
+                                    "group flex items-center justify-between p-3 rounded-xl transition-all duration-200 cursor-pointer border",
+                                    activeSession === session.id
+                                        ? "bg-primary/10 border-primary/20"
+                                        : "hover:bg-white/5 border-transparent hover:border-white/5"
+                                )}
+                                onClick={() => handleSessionClick(session)}
+                            >
+                                <div className="flex items-center gap-3 overflow-hidden">
+                                    <div className={cn(
+                                        "w-2 h-2 rounded-full",
+                                        activeSession === session.id ? "bg-primary shadow-[0_0_8px_rgba(124,58,237,0.5)]" : "bg-muted-foreground/30"
+                                    )} />
+                                    <div className="flex flex-col overflow-hidden">
+                                        <span className={cn(
+                                            "text-sm font-medium truncate",
+                                            activeSession === session.id ? "text-white" : "text-muted-foreground group-hover:text-white"
+                                        )}>
+                                            {session.name}
+                                        </span>
+                                        <span className="text-xs text-muted-foreground truncate opacity-60">
+                                            {session.preview}
+                                        </span>
+                                    </div>
                                 </div>
-                            </div>
 
-                            <DropdownMenu>
-                                <DropdownMenuTrigger asChild>
-                                    <Button variant="ghost" size="icon" className="h-6 w-6 opacity-0 group-hover:opacity-100 transition-opacity">
-                                        <MoreVertical size={14} className="text-muted-foreground" />
-                                    </Button>
-                                </DropdownMenuTrigger>
-                                <DropdownMenuContent align="end" className="w-40 bg-sidebar border-white/10">
-                                    <DropdownMenuItem className="text-destructive focus:text-destructive focus:bg-destructive/10 cursor-pointer">
-                                        <Trash2 size={14} className="mr-2" />
-                                        Delete
-                                    </DropdownMenuItem>
-                                </DropdownMenuContent>
-                            </DropdownMenu>
-                        </div>
-                    ))}
+                                <DropdownMenu>
+                                    <DropdownMenuTrigger asChild>
+                                        <Button variant="ghost" size="icon" className="h-6 w-6 opacity-0 group-hover:opacity-100 transition-opacity">
+                                            <MoreVertical size={14} className="text-muted-foreground" />
+                                        </Button>
+                                    </DropdownMenuTrigger>
+                                    <DropdownMenuContent align="end" className="w-40 bg-sidebar border-white/10">
+                                        <DropdownMenuItem
+                                            className="text-destructive focus:text-destructive focus:bg-destructive/10 cursor-pointer"
+                                            onClick={(e) => handleDeleteSession(session.id, e)}
+                                        >
+                                            <Trash2 size={14} className="mr-2" />
+                                            Delete
+                                        </DropdownMenuItem>
+                                    </DropdownMenuContent>
+                                </DropdownMenu>
+                            </div>
+                        ))
+                    )}
                 </div>
 
                 {/* FAQ/Guide Section */}

@@ -11,6 +11,7 @@ export default function Home() {
     const [filesOpen, setFilesOpen] = useState(false);
     const [settingsOpen, setSettingsOpen] = useState(false);
     const [sidebarOpen, setSidebarOpen] = useState(false);
+    const [currentSession, setCurrentSession] = useState({ id: "1", name: "Alan Turing" });
 
     const handleOpenFiles = () => {
         setFilesOpen(true);
@@ -22,6 +23,11 @@ export default function Home() {
         setSidebarOpen(false);
     };
 
+    const handleSessionChange = (session) => {
+        setCurrentSession(session);
+        setSidebarOpen(false);
+    };
+
     return (
         <div className="flex h-screen w-full bg-background overflow-hidden text-foreground">
             {/* Desktop Sidebar */}
@@ -29,6 +35,7 @@ export default function Home() {
                 <Sidebar
                     onOpenFiles={handleOpenFiles}
                     onOpenSettings={handleOpenSettings}
+                    onSessionChange={handleSessionChange}
                 />
             </div>
 
@@ -38,6 +45,7 @@ export default function Home() {
                     <Sidebar
                         onOpenFiles={handleOpenFiles}
                         onOpenSettings={handleOpenSettings}
+                        onSessionChange={handleSessionChange}
                     />
                 </SheetContent>
             </Sheet>
@@ -55,7 +63,10 @@ export default function Home() {
                     </Sheet>
                 </div>
 
-                <ChatInterface />
+                <ChatInterface
+                    sessionId={currentSession.id}
+                    sessionName={currentSession.name}
+                />
             </main>
 
             <FilesModal open={filesOpen} onOpenChange={setFilesOpen} />
