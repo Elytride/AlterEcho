@@ -19,12 +19,14 @@ DONE /
 3. Data sorting 2
 - create RAG system for "context"
 - create data summary system for "style" via gemini
+DONE /
 
 4. Chatbot system
 - chatbot with "context" only (RAG system implementation)
 - chatbot with "style only" (data summary system implementation)
 - chatbot with "style" and "context"
+DONE /
 
 5. enhancement
-- token use optimisation
+- token use optimisation [DONE /]
 - instead of having the user input the name, use ai to find the name for each file based on what the user said as context

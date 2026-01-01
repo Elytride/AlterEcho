@@ -331,3 +331,111 @@ def generate_context_file(file_results, output_path):
     
     print(f"Context file written to: {output_path} ({len(all_messages)} messages, {filtered_count} filtered out)")
 
+
+# ============== Stage 3: Context Chunking for RAG ==============
+
+import json as json_module
+
+def generate_context_chunks(file_results, output_path, chunk_minutes=30):
+    """
+    Generate enriched context chunks for RAG system.
+    Groups messages into conversation blocks based on time windows.
+    
+    Args:
+        file_results: list of (filename, filepath, filetype, subject) tuples
+        output_path: path to write JSON output
+        chunk_minutes: time window for grouping messages (default 30 mins)
+    """
+    all_chunks = []
+    chunk_id = 0
+    
+    for filename, filepath, filetype, subject in file_results:
+        # Parse messages based on file type
+        if filetype == 'Instagram':
+            messages = parse_instagram_messages(filepath)
+        elif filetype == 'WhatsApp':
+            messages = parse_whatsapp_messages(filepath)
+        else:
+            continue
+        
+        if not messages:
+            continue
+        
+        # Sort by timestamp
+        messages.sort(key=lambda x: x[0])
+        
+        # Find conversation partners (everyone except the subject)
+        partners = set(msg[1] for msg in messages if msg[1] != subject)
+        partner_name = ', '.join(partners) if partners else 'Unknown'
+        
+        # Group messages into time-based chunks
+        current_chunk = None
+        chunk_window = timedelta(minutes=chunk_minutes)
+        
+        for dt, sender, content in messages:
+            # Skip empty or media-only
+            if not content.strip() or content == '<Media omitted>':
+                continue
+            
+            # Check if we need to start a new chunk
+            if current_chunk is None or (dt - current_chunk['end_time']) > chunk_window:
+                # Save previous chunk if exists
+                if current_chunk is not None and current_chunk['messages']:
+                    # Only save if subject participated
+                    if any(m['sender'] == subject for m in current_chunk['messages']):
+                        all_chunks.append(finalize_chunk(current_chunk, subject, chunk_id))
+                        chunk_id += 1
+                
+                # Start new chunk
+                current_chunk = {
+                    'start_time': dt,
+                    'end_time': dt,
+                    'source_file': filename,
+                    'partner': partner_name,
+                    'messages': []
+                }
+            
+            # Add message to current chunk
+            current_chunk['messages'].append({
+                'sender': sender,
+                'text': content,
+                'timestamp': dt.isoformat()
+            })
+            current_chunk['end_time'] = dt
+        
+        # Don't forget the last chunk
+        if current_chunk is not None and current_chunk['messages']:
+            if any(m['sender'] == subject for m in current_chunk['messages']):
+                all_chunks.append(finalize_chunk(current_chunk, subject, chunk_id))
+                chunk_id += 1
+    
+    # Write to JSON file
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json_module.dump({'chunks': all_chunks, 'subject': file_results[0][3] if file_results else 'Unknown'}, f, indent=2)
+    
+    print(f"Context chunks written to: {output_path} ({len(all_chunks)} chunks)")
+    return all_chunks
+
+
+def finalize_chunk(chunk_data, subject, chunk_id):
+    """
+    Finalize a chunk by extracting subject messages and creating summary text.
+    """
+    subject_messages = [m['text'] for m in chunk_data['messages'] if m['sender'] == subject]
+    
+    # Create a searchable text representation
+    full_exchange_text = '\n'.join([f"{m['sender']}: {m['text']}" for m in chunk_data['messages']])
+    subject_text = '\n'.join(subject_messages)
+    
+    return {
+        'id': f"chunk_{chunk_id:04d}",
+        'date': chunk_data['start_time'].strftime('%Y-%m-%d'),
+        'time_range': f"{chunk_data['start_time'].strftime('%H:%M')}-{chunk_data['end_time'].strftime('%H:%M')}",
+        'source_file': chunk_data['source_file'],
+        'partner': chunk_data['partner'],
+        'subject_messages': subject_messages,
+        'subject_text': subject_text,  # For embedding
+        'full_exchange': chunk_data['messages'],
+        'message_count': len(chunk_data['messages'])
+    }

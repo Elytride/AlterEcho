@@ -5,7 +5,9 @@ import io
 # Fix Windows console encoding for Unicode characters
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
-from processor import classify_file, extract_participants, generate_style_file, generate_context_file
+from processor import classify_file, extract_participants, generate_style_file, generate_context_file, generate_context_chunks
+from style_summarizer import generate_style_summary
+from context_embedder import generate_embeddings
 
 def main():
     data_folder = os.path.join(os.getcwd(), 'data')
@@ -86,7 +88,22 @@ def main():
         print("\n--- Generating Preprocessed Files ---")
         generate_style_file(final_results, style_path)
         generate_context_file(final_results, context_path)
+        
+        # --- Stage 3: Generate style summary via Gemini ---
+        style_summary_path = os.path.join(preprocessed_folder, 'style', f'{subject_name}_style_summary.txt')
+        generate_style_summary(style_path, style_summary_path, subject_name)
+        
+        # --- Stage 4: Generate context chunks for RAG ---
+        chunks_path = os.path.join(preprocessed_folder, 'context', f'{subject_name}_context_chunks.json')
+        generate_context_chunks(final_results, chunks_path)
+        
+        # --- Stage 5: Generate embeddings for context chunks ---
+        embeddings_path = os.path.join(preprocessed_folder, 'context', f'{subject_name}_context_embeddings.json')
+        generate_embeddings(chunks_path, embeddings_path)
+        
         print("\nPreprocessing complete!")
+        print(f"\nTo start chatting, run:")
+        print(f"  python chatbot.py {subject_name}")
 
 if __name__ == "__main__":
     main()
