@@ -98,6 +98,17 @@ export async function deleteUploadedFile(fileType, fileId) {
     return response.json();
 }
 
+// --- ZIP Handling ---
+export async function selectZipConversations(zipId, conversations) {
+    const response = await fetch(`${API_BASE}/files/text/zip/select`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ zip_id: zipId, conversations }),
+    });
+    if (!response.ok) throw new Error('Failed to select ZIP conversations');
+    return response.json();
+}
+
 // --- AI Refresh ---
 export async function checkRefreshReady() {
     const response = await fetch(`${API_BASE}/refresh/ready`);

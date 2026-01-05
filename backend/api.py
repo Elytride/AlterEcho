@@ -19,6 +19,9 @@ load_dotenv(ROOT_DIR / ".env")
 
 # Import processing modules
 from processor import classify_file, extract_participants
+from instagram_zip_processor import (
+    extract_zip, find_conversations, merge_conversation_messages, cleanup_zip
+)
 
 app = Flask(__name__)
 
@@ -32,7 +35,10 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 (UPLOAD_DIR / "voice").mkdir(exist_ok=True)
 
 # Allowed extensions for text files
-ALLOWED_TEXT_EXTENSIONS = {'.txt', '.json'}
+ALLOWED_TEXT_EXTENSIONS = {'.txt', '.json', '.zip'}
+
+# Storage for pending ZIP uploads (zip_id -> extraction info)
+pending_zips = {}
 
 
 def compute_file_hash(file_path):
@@ -188,8 +194,53 @@ def upload_files(file_type):
             })
             continue
         
-        # For text files, validate it's WhatsApp or Instagram
+        # For text files, validate it's WhatsApp or Instagram (or ZIP)
         if file_type == "text":
+            # Handle ZIP files specially
+            if file_ext == '.zip':
+                try:
+                    # Extract and find conversations
+                    zip_id = file_id
+                    extracted_path = extract_zip(str(file_path), zip_id)
+                    conversations = find_conversations(extracted_path)
+                    
+                    if not conversations:
+                        # No valid Instagram conversations found
+                        file_path.unlink()
+                        cleanup_zip(zip_id)
+                        rejected.append({
+                            "name": file.filename,
+                            "reason": "No Instagram conversations found in ZIP. Make sure this is an Instagram data export."
+                        })
+                        continue
+                    
+                    # Store the ZIP info for later selection
+                    pending_zips[zip_id] = {
+                        "zip_path": str(file_path),
+                        "extracted_path": str(extracted_path),
+                        "original_name": file.filename,
+                        "conversations": conversations
+                    }
+                    
+                    # Return special response for ZIP
+                    return jsonify({
+                        "success": True,
+                        "type": "zip_upload",
+                        "zip_id": zip_id,
+                        "original_name": file.filename,
+                        "conversations": conversations,
+                        "uploaded": [],
+                        "rejected": rejected
+                    })
+                    
+                except Exception as e:
+                    file_path.unlink()
+                    rejected.append({
+                        "name": file.filename,
+                        "reason": f"Failed to process ZIP file: {str(e)}"
+                    })
+                    continue
+            
             detected_type = classify_file(str(file_path))
             
             if detected_type not in ["WhatsApp", "Instagram"]:
@@ -197,7 +248,7 @@ def upload_files(file_type):
                 file_path.unlink()
                 rejected.append({
                     "name": file.filename,
-                    "reason": "Not a supported chat file. Please upload WhatsApp or Instagram chat exports."
+                    "reason": "Not a supported chat file. Please upload WhatsApp exports (.txt), Instagram exports (.json), or Instagram ZIP exports."
                 })
                 continue
             
@@ -241,6 +292,118 @@ def upload_files(file_type):
         "rejected_count": len(rejected)
     })
 
+
+@app.route("/api/files/text/zip/select", methods=["POST"])
+def select_zip_conversations():
+    """
+    Select conversations from a previously uploaded ZIP file.
+    Request body: { "zip_id": "...", "conversations": ["folder_name1", "folder_name2"] }
+    """
+    import json as json_module
+    
+    data = request.get_json()
+    zip_id = data.get("zip_id")
+    selected_folders = data.get("conversations", [])
+    
+    if not zip_id or zip_id not in pending_zips:
+        return jsonify({"error": "ZIP not found or expired"}), 404
+    
+    if not selected_folders:
+        return jsonify({"error": "No conversations selected"}), 400
+    
+    zip_info = pending_zips[zip_id]
+    conversations = zip_info["conversations"]
+    
+    # Find selected conversations by folder name
+    selected_convs = [c for c in conversations if c["folder_name"] in selected_folders]
+    
+    if not selected_convs:
+        return jsonify({"error": "Selected conversations not found"}), 400
+    
+    uploaded = []
+    rejected = []
+    folder = UPLOAD_DIR / "text"
+    existing_hashes = get_existing_hashes(folder)
+    
+    for conv in selected_convs:
+        try:
+            # Merge all message files into one JSON
+            merged_data = merge_conversation_messages(conv["path"])
+            
+            if not merged_data:
+                rejected.append({
+                    "name": conv["display_name"],
+                    "reason": "Failed to merge conversation messages"
+                })
+                continue
+            
+            # Generate unique filename
+            file_id = uuid.uuid4().hex[:12]
+            file_name = f"{file_id}.json"
+            file_path = folder / file_name
+            
+            # Save merged JSON
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json_module.dump(merged_data, f, ensure_ascii=False)
+            
+            # Check for duplicates
+            file_hash = compute_file_hash(file_path)
+            if file_hash in existing_hashes:
+                file_path.unlink()
+                rejected.append({
+                    "name": conv["display_name"],
+                    "reason": "Duplicate conversation already uploaded"
+                })
+                continue
+            
+            # Get participants from merged data
+            participants = []
+            if 'participants' in merged_data:
+                for p in merged_data['participants']:
+                    name = p.get('name', 'Unknown')
+                    try:
+                        name = name.encode('latin-1').decode('utf-8')
+                    except:
+                        pass
+                    participants.append(name)
+            
+            uploaded.append({
+                "id": file_id,
+                "original_name": f"{conv['display_name']} (from ZIP)",
+                "saved_as": file_name,
+                "file_type": "text",
+                "detected_type": "Instagram",
+                "participants": participants,
+                "subject": None,
+                "path": str(file_path),
+                "size": file_path.stat().st_size
+            })
+            
+        except Exception as e:
+            rejected.append({
+                "name": conv["display_name"],
+                "reason": f"Error processing: {str(e)}"
+            })
+    
+    # Cleanup: delete ZIP file and temp extraction
+    try:
+        zip_path = Path(zip_info["zip_path"])
+        if zip_path.exists():
+            zip_path.unlink()
+        cleanup_zip(zip_id)
+    except Exception as e:
+        print(f"Cleanup error: {e}")
+    
+    # Remove from pending
+    del pending_zips[zip_id]
+    
+    return jsonify({
+        "success": True,
+        "uploaded": uploaded,
+        "rejected": rejected,
+        "uploaded_count": len(uploaded),
+        "rejected_count": len(rejected)
+    })
 
 @app.route("/api/files/<file_type>", methods=["GET"])
 def list_files(file_type):

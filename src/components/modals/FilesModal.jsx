@@ -5,10 +5,10 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { FileText, Mic, Upload, RefreshCw, Check, X, MessageSquare, Instagram, HelpCircle, User, Trash2, AlertCircle, CheckCircle2, Clock } from "lucide-react";
+import { FileText, Mic, Upload, RefreshCw, Check, X, MessageSquare, Instagram, HelpCircle, User, Trash2, AlertCircle, CheckCircle2, Clock, Archive, Users } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 import { motion, AnimatePresence } from "framer-motion";
-import { uploadFile, refreshAIMemory, checkRefreshReady, setSubject, deleteUploadedFile, listFiles, cloneVoice, getVoiceStatus } from "@/lib/api";
+import { uploadFile, refreshAIMemory, checkRefreshReady, setSubject, deleteUploadedFile, listFiles, cloneVoice, getVoiceStatus, selectZipConversations } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 // File type badge component
@@ -54,6 +54,11 @@ export function FilesModal({ open, onOpenChange, currentSession }) {
     // Voice cloning state
     const [voiceStatus, setVoiceStatus] = useState(null);
     const [cloning, setCloning] = useState(false);
+
+    // ZIP upload state
+    const [pendingZip, setPendingZip] = useState(null); // { zip_id, original_name, conversations }
+    const [selectedConversations, setSelectedConversations] = useState([]);
+    const [importingZip, setImportingZip] = useState(false);
 
     const textInputRef = useRef(null);
     const voiceInputRef = useRef(null);
@@ -172,6 +177,19 @@ export function FilesModal({ open, onOpenChange, currentSession }) {
         try {
             const result = await uploadFile(files, fileType);
 
+            // Check if this is a ZIP upload response
+            if (result.type === "zip_upload") {
+                // Show conversation picker
+                setPendingZip({
+                    zip_id: result.zip_id,
+                    original_name: result.original_name,
+                    conversations: result.conversations
+                });
+                // Pre-select all conversations
+                setSelectedConversations(result.conversations.map(c => c.folder_name));
+                return;
+            }
+
             // Handle rejected files
             if (result.rejected && result.rejected.length > 0) {
                 setRejectedFiles(result.rejected);
@@ -188,6 +206,52 @@ export function FilesModal({ open, onOpenChange, currentSession }) {
         }
     };
 
+    const handleImportZipConversations = async () => {
+        if (!pendingZip || selectedConversations.length === 0) return;
+
+        setImportingZip(true);
+        setUploadError(null);
+
+        try {
+            const result = await selectZipConversations(pendingZip.zip_id, selectedConversations);
+
+            // Handle rejected conversations
+            if (result.rejected && result.rejected.length > 0) {
+                setRejectedFiles(result.rejected);
+            }
+
+            if (result.uploaded && result.uploaded.length > 0) {
+                setSuccessMessage(`Imported ${result.uploaded.length} conversation(s) from ZIP`);
+                setTimeout(() => setSuccessMessage(null), 5000);
+            }
+
+            // Clear pending ZIP and refresh list
+            setPendingZip(null);
+            setSelectedConversations([]);
+            await refreshFileList();
+
+        } catch (error) {
+            console.error("Failed to import conversations:", error);
+            setUploadError("Failed to import conversations. Please try again.");
+        } finally {
+            setImportingZip(false);
+        }
+    };
+
+    const handleCancelZip = () => {
+        setPendingZip(null);
+        setSelectedConversations([]);
+    };
+
+    const toggleConversationSelection = (folderName) => {
+        setSelectedConversations(prev =>
+            prev.includes(folderName)
+                ? prev.filter(f => f !== folderName)
+                : [...prev, folderName]
+        );
+    };
+
+
     const handleSubjectChange = async (fileType, fileId, subject) => {
         try {
             await setSubject(fileType, fileId, subject);
@@ -198,6 +262,9 @@ export function FilesModal({ open, onOpenChange, currentSession }) {
                     f.id === fileId ? { ...f, subject } : f
                 )
             }));
+            // Auto-update refresh ready state
+            const readyResult = await checkRefreshReady();
+            setRefreshReady(readyResult);
         } catch (error) {
             console.error("Failed to set subject:", error);
         }
@@ -416,14 +483,119 @@ export function FilesModal({ open, onOpenChange, currentSession }) {
 
                         <div className="p-6 border border-white/5 border-t-0 rounded-b-lg bg-black/20 min-h-[300px]">
                             <TabsContent value="text" className="space-y-4 mt-0">
-                                <UploadZone
-                                    fileType="text"
-                                    icon={Upload}
-                                    title="Drop WhatsApp or Instagram chat exports"
-                                    accept=".txt,.json"
-                                    inputRef={textInputRef}
-                                    description="Only .txt and .json files are accepted"
-                                />
+                                {/* ZIP Conversation Picker */}
+                                {pendingZip ? (
+                                    <div className="space-y-4">
+                                        <div className="p-4 bg-pink-500/10 border border-pink-500/20 rounded-lg">
+                                            <div className="flex items-center gap-3 mb-4">
+                                                <div className="w-10 h-10 rounded-full bg-pink-500/20 flex items-center justify-center">
+                                                    <Archive size={20} className="text-pink-400" />
+                                                </div>
+                                                <div className="flex-1">
+                                                    <p className="font-medium text-white">Instagram ZIP Detected</p>
+                                                    <p className="text-xs text-muted-foreground">{pendingZip.original_name}</p>
+                                                </div>
+                                            </div>
+
+                                            <div className="mb-3">
+                                                <div className="flex items-center justify-between mb-2">
+                                                    <Label className="text-sm">Select conversations to import ({selectedConversations.length}/{pendingZip.conversations.length})</Label>
+                                                    <div className="flex gap-2">
+                                                        <Button
+                                                            variant="ghost"
+                                                            size="sm"
+                                                            className="h-6 text-xs"
+                                                            onClick={() => setSelectedConversations(pendingZip.conversations.map(c => c.folder_name))}
+                                                        >
+                                                            Select All
+                                                        </Button>
+                                                        <Button
+                                                            variant="ghost"
+                                                            size="sm"
+                                                            className="h-6 text-xs"
+                                                            onClick={() => setSelectedConversations([])}
+                                                        >
+                                                            Clear
+                                                        </Button>
+                                                    </div>
+                                                </div>
+                                                <div className="max-h-[200px] overflow-y-auto space-y-2 pr-2">
+                                                    {pendingZip.conversations.map((conv) => (
+                                                        <div
+                                                            key={conv.folder_name}
+                                                            className={cn(
+                                                                "p-3 rounded-lg cursor-pointer transition-colors border",
+                                                                selectedConversations.includes(conv.folder_name)
+                                                                    ? "bg-pink-500/20 border-pink-500/30"
+                                                                    : "bg-white/5 border-white/10 hover:bg-white/10"
+                                                            )}
+                                                            onClick={() => toggleConversationSelection(conv.folder_name)}
+                                                        >
+                                                            <div className="flex items-center gap-3">
+                                                                <div className={cn(
+                                                                    "w-5 h-5 rounded border-2 flex items-center justify-center transition-colors",
+                                                                    selectedConversations.includes(conv.folder_name)
+                                                                        ? "bg-pink-500 border-pink-500"
+                                                                        : "border-white/30"
+                                                                )}>
+                                                                    {selectedConversations.includes(conv.folder_name) && (
+                                                                        <Check size={12} className="text-white" />
+                                                                    )}
+                                                                </div>
+                                                                <div className="flex-1 min-w-0">
+                                                                    <p className="text-sm font-medium truncate">{conv.display_name}</p>
+                                                                    <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                                                                        <Users size={10} />
+                                                                        <span>{conv.participants.join(", ")}</span>
+                                                                        <span>•</span>
+                                                                        <span>{conv.message_count.toLocaleString()} messages</span>
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+
+                                            <div className="flex gap-3">
+                                                <Button
+                                                    className="flex-1 bg-pink-500 hover:bg-pink-600 text-white"
+                                                    onClick={handleImportZipConversations}
+                                                    disabled={selectedConversations.length === 0 || importingZip}
+                                                >
+                                                    {importingZip ? (
+                                                        <>
+                                                            <RefreshCw size={14} className="mr-2 animate-spin" />
+                                                            Importing...
+                                                        </>
+                                                    ) : (
+                                                        <>
+                                                            <Check size={14} className="mr-2" />
+                                                            Import {selectedConversations.length} Conversation{selectedConversations.length !== 1 ? 's' : ''}
+                                                        </>
+                                                    )}
+                                                </Button>
+                                                <Button
+                                                    variant="outline"
+                                                    className="border-white/10"
+                                                    onClick={handleCancelZip}
+                                                    disabled={importingZip}
+                                                >
+                                                    Cancel
+                                                </Button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                ) : (
+                                    <UploadZone
+                                        fileType="text"
+                                        icon={Upload}
+                                        title="Drop WhatsApp or Instagram chat exports"
+                                        accept=".txt,.json,.zip"
+                                        inputRef={textInputRef}
+                                        description=".txt, .json files or Instagram .zip exports"
+                                    />
+                                )}
 
                                 <div className="space-y-3 pt-4">
                                     <Label>Additional Context</Label>
