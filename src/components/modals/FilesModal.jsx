@@ -16,6 +16,8 @@ function FileTypeBadge({ type }) {
     const configs = {
         WhatsApp: { bg: "bg-green-500/20", text: "text-green-400", icon: MessageSquare, label: "WhatsApp" },
         Instagram: { bg: "bg-pink-500/20", text: "text-pink-400", icon: Instagram, label: "Instagram" },
+        LINE: { bg: "bg-emerald-500/20", text: "text-emerald-400", icon: MessageSquare, label: "LINE" },
+        Discord: { bg: "bg-indigo-500/20", text: "text-indigo-400", icon: MessageSquare, label: "Discord" },
         voice: { bg: "bg-purple-500/20", text: "text-purple-400", icon: Mic, label: "Voice" },
         NULL: { bg: "bg-gray-500/20", text: "text-gray-400", icon: HelpCircle, label: "Unknown" },
         unknown: { bg: "bg-gray-500/20", text: "text-gray-400", icon: HelpCircle, label: "Unknown" }
@@ -177,13 +179,14 @@ export function FilesModal({ open, onOpenChange, currentSession }) {
         try {
             const result = await uploadFile(files, fileType);
 
-            // Check if this is a ZIP upload response
-            if (result.type === "zip_upload") {
+            // Check if this is a ZIP upload response (Instagram or Discord)
+            if (result.type === "zip_upload" || result.type === "discord_zip_upload") {
                 // Show conversation picker
                 setPendingZip({
                     zip_id: result.zip_id,
                     original_name: result.original_name,
-                    conversations: result.conversations
+                    conversations: result.conversations,
+                    zip_type: result.type === "discord_zip_upload" ? "discord" : "instagram"
                 });
                 // Pre-select all conversations
                 setSelectedConversations(result.conversations.map(c => c.folder_name));
@@ -479,6 +482,7 @@ export function FilesModal({ open, onOpenChange, currentSession }) {
                                 <Mic className="w-4 h-4 mr-2" />
                                 Voice
                             </TabsTrigger>
+
                         </TabsList>
 
                         <div className="p-6 border border-white/5 border-t-0 rounded-b-lg bg-black/20 min-h-[300px]">
@@ -486,20 +490,32 @@ export function FilesModal({ open, onOpenChange, currentSession }) {
                                 {/* ZIP Conversation Picker */}
                                 {pendingZip ? (
                                     <div className="space-y-4">
-                                        <div className="p-4 bg-pink-500/10 border border-pink-500/20 rounded-lg">
+                                        <div className={cn(
+                                            "p-4 border rounded-lg",
+                                            pendingZip.zip_type === "discord"
+                                                ? "bg-indigo-500/10 border-indigo-500/20"
+                                                : "bg-pink-500/10 border-pink-500/20"
+                                        )}>
                                             <div className="flex items-center gap-3 mb-4">
-                                                <div className="w-10 h-10 rounded-full bg-pink-500/20 flex items-center justify-center">
-                                                    <Archive size={20} className="text-pink-400" />
+                                                <div className={cn(
+                                                    "w-10 h-10 rounded-full flex items-center justify-center",
+                                                    pendingZip.zip_type === "discord" ? "bg-indigo-500/20" : "bg-pink-500/20"
+                                                )}>
+                                                    <Archive size={20} className={pendingZip.zip_type === "discord" ? "text-indigo-400" : "text-pink-400"} />
                                                 </div>
                                                 <div className="flex-1">
-                                                    <p className="font-medium text-white">Instagram ZIP Detected</p>
+                                                    <p className="font-medium text-white">
+                                                        {pendingZip.zip_type === "discord" ? "Discord" : "Instagram"} ZIP Detected
+                                                    </p>
                                                     <p className="text-xs text-muted-foreground">{pendingZip.original_name}</p>
                                                 </div>
                                             </div>
 
                                             <div className="mb-3">
                                                 <div className="flex items-center justify-between mb-2">
-                                                    <Label className="text-sm">Select conversations to import ({selectedConversations.length}/{pendingZip.conversations.length})</Label>
+                                                    <Label className="text-sm">
+                                                        Select {pendingZip.zip_type === "discord" ? "DMs" : "conversations"} to import ({selectedConversations.length}/{pendingZip.conversations.length})
+                                                    </Label>
                                                     <div className="flex gap-2">
                                                         <Button
                                                             variant="ghost"
@@ -526,7 +542,9 @@ export function FilesModal({ open, onOpenChange, currentSession }) {
                                                             className={cn(
                                                                 "p-3 rounded-lg cursor-pointer transition-colors border",
                                                                 selectedConversations.includes(conv.folder_name)
-                                                                    ? "bg-pink-500/20 border-pink-500/30"
+                                                                    ? pendingZip.zip_type === "discord"
+                                                                        ? "bg-indigo-500/20 border-indigo-500/30"
+                                                                        : "bg-pink-500/20 border-pink-500/30"
                                                                     : "bg-white/5 border-white/10 hover:bg-white/10"
                                                             )}
                                                             onClick={() => toggleConversationSelection(conv.folder_name)}
@@ -535,7 +553,9 @@ export function FilesModal({ open, onOpenChange, currentSession }) {
                                                                 <div className={cn(
                                                                     "w-5 h-5 rounded border-2 flex items-center justify-center transition-colors",
                                                                     selectedConversations.includes(conv.folder_name)
-                                                                        ? "bg-pink-500 border-pink-500"
+                                                                        ? pendingZip.zip_type === "discord"
+                                                                            ? "bg-indigo-500 border-indigo-500"
+                                                                            : "bg-pink-500 border-pink-500"
                                                                         : "border-white/30"
                                                                 )}>
                                                                     {selectedConversations.includes(conv.folder_name) && (
@@ -546,8 +566,12 @@ export function FilesModal({ open, onOpenChange, currentSession }) {
                                                                     <p className="text-sm font-medium truncate">{conv.display_name}</p>
                                                                     <div className="flex items-center gap-2 text-xs text-muted-foreground">
                                                                         <Users size={10} />
-                                                                        <span>{conv.participants.join(", ")}</span>
-                                                                        <span>•</span>
+                                                                        {conv.participants && conv.participants.length > 0 ? (
+                                                                            <>
+                                                                                <span>{conv.participants.join(", ")}</span>
+                                                                                <span>•</span>
+                                                                            </>
+                                                                        ) : null}
                                                                         <span>{conv.message_count.toLocaleString()} messages</span>
                                                                     </div>
                                                                 </div>
@@ -559,7 +583,12 @@ export function FilesModal({ open, onOpenChange, currentSession }) {
 
                                             <div className="flex gap-3">
                                                 <Button
-                                                    className="flex-1 bg-pink-500 hover:bg-pink-600 text-white"
+                                                    className={cn(
+                                                        "flex-1 text-white",
+                                                        pendingZip.zip_type === "discord"
+                                                            ? "bg-indigo-500 hover:bg-indigo-600"
+                                                            : "bg-pink-500 hover:bg-pink-600"
+                                                    )}
                                                     onClick={handleImportZipConversations}
                                                     disabled={selectedConversations.length === 0 || importingZip}
                                                 >
@@ -571,7 +600,7 @@ export function FilesModal({ open, onOpenChange, currentSession }) {
                                                     ) : (
                                                         <>
                                                             <Check size={14} className="mr-2" />
-                                                            Import {selectedConversations.length} Conversation{selectedConversations.length !== 1 ? 's' : ''}
+                                                            Import {selectedConversations.length} {pendingZip.zip_type === "discord" ? "DM" : "Conversation"}{selectedConversations.length !== 1 ? 's' : ''}
                                                         </>
                                                     )}
                                                 </Button>
@@ -590,10 +619,10 @@ export function FilesModal({ open, onOpenChange, currentSession }) {
                                     <UploadZone
                                         fileType="text"
                                         icon={Upload}
-                                        title="Drop WhatsApp or Instagram chat exports"
+                                        title="Drop chat exports here"
                                         accept=".txt,.json,.zip"
                                         inputRef={textInputRef}
-                                        description=".txt, .json files or Instagram .zip exports"
+                                        description="WhatsApp, Instagram, LINE (.txt, .json) or ZIP exports"
                                     />
                                 )}
 

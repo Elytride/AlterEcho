@@ -4,11 +4,15 @@ import os
 
 def classify_file(file_path):
     """
-    Classifies a file as 'WhatsApp', 'Instagram', or 'NULL'.
+    Classifies a file as 'WhatsApp', 'Instagram', 'LINE', or 'NULL'.
     """
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read(4096) # Read first 4KB to check format
+
+        # Check for LINE (starts with [LINE] header)
+        if content.strip().startswith('[LINE]'):
+            return 'LINE'
 
         # Check for Instagram (JSON format with 'participants' and 'messages')
         content_stripped = content.strip()
@@ -68,6 +72,22 @@ def extract_participants(file_path, file_type):
                 if match:
                     sender = match.group(1)
                     participants.add(sender)
+        
+        elif file_type == 'LINE':
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            
+            # LINE format: HH:MM[AM/PM]\tSender\tMessage
+            # Examples: "11:36PM\tSender\tMsg", "11:36 PM\tSender\tMsg", "23:36\tSender\tMsg"
+            # We allow optional space before AM/PM
+            line_pattern = r'^\d{1,2}:\d{2}(?:\s*[AP]M)?\t(.+?)\t'
+            
+            for line in lines:
+                match = re.match(line_pattern, line, re.IGNORECASE)
+                if match:
+                    sender = match.group(1).strip()
+                    if sender:
+                        participants.add(sender)
                     
     except Exception as e:
         print(f"Error extracting participants from {file_path}: {e}")
@@ -169,6 +189,80 @@ def parse_whatsapp_messages(file_path):
     
     return messages
 
+def parse_line_messages(file_path):
+    """
+    Parse LINE .txt file and return list of (datetime, sender, content) tuples.
+    Messages are returned in chronological order (oldest first).
+    
+    LINE format:
+    [LINE] Chat history with <Name>
+    Saved on: DD/MM/YYYY, HH:MM
+    
+    Day, DD/MM/YYYY
+    HH:MM[AM/PM]\tSender\tMessage
+    """
+    messages = []
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        current_date = None
+        
+        # Pattern for date headers: "Day, DD/MM/YYYY" or just "DD/MM/YYYY" or "YYYY/MM/DD"
+        # We'll stick to the sample: "Tue, 06/01/2026"
+        date_header_pattern = r'^(?:[A-Za-z]{3},\s)?(\d{1,2}/\d{1,2}/\d{4})'
+        
+        # Pattern for messages: "HH:MM[AM/PM]\tSender\tMessage"
+        # make strict check for tab to separate sender/message
+        msg_pattern = r'^(\d{1,2}:\d{2}(?:\s*[AP]M)?)\t(.+?)\t(.*)$'
+        
+        for line in lines:
+            line = line.rstrip('\r\n')
+            
+            # Check for date header
+            date_match = re.match(date_header_pattern, line, re.IGNORECASE)
+            if date_match:
+                current_date = date_match.group(1)
+                continue
+            
+            # Check for message
+            msg_match = re.match(msg_pattern, line, re.IGNORECASE)
+            if msg_match and current_date:
+                time_str = msg_match.group(1)
+                sender = msg_match.group(2).strip()
+                content = msg_match.group(3).strip()
+                
+                # Parse datetime
+                try:
+                    dt_str = f"{current_date} {time_str}"
+                    # Try with AM/PM (with optional space)
+                    # We normalize space first
+                    time_part = time_str.strip().upper()
+                    # If space exists like "11:36 PM", strptime needs "%I:%M %p"
+                    # If no space like "11:36PM", strptime needs "%I:%M%p"
+                    
+                    try:
+                        if ' ' in time_part:
+                             dt = datetime.strptime(f"{current_date} {time_part}", "%d/%m/%Y %I:%M %p")
+                        elif 'M' in time_part: # AM or PM
+                             dt = datetime.strptime(f"{current_date} {time_part}", "%d/%m/%Y %I:%M%p")
+                        else:
+                             # 24-hour format
+                             dt = datetime.strptime(f"{current_date} {time_part}", "%d/%m/%Y %H:%M")
+                    except:
+                         # Fallback to current date
+                         dt = datetime.now()
+                except:
+                    dt = datetime.now()
+                
+                if content:  # Only add non-empty messages
+                    messages.append((dt, sender, content))
+            
+    except Exception as e:
+        print(f"Error parsing LINE file {file_path}: {e}")
+    
+    return messages
+
 def filter_messages_by_months(messages, months=3):
     """
     Filter messages to only include the last N months from the most recent message.
@@ -203,6 +297,8 @@ def generate_style_file(file_results, output_path, max_lines_per_file=5000):
             messages = parse_instagram_messages(filepath)
         elif filetype == 'WhatsApp':
             messages = parse_whatsapp_messages(filepath)
+        elif filetype == 'LINE':
+            messages = parse_line_messages(filepath)
         else:
             continue
         
@@ -292,6 +388,8 @@ def generate_context_file(file_results, output_path):
             messages = parse_instagram_messages(filepath)
         elif filetype == 'WhatsApp':
             messages = parse_whatsapp_messages(filepath)
+        elif filetype == 'LINE':
+            messages = parse_line_messages(filepath)
         else:
             continue
         
@@ -336,15 +434,16 @@ def generate_context_file(file_results, output_path):
 
 import json as json_module
 
-def generate_context_chunks(file_results, output_path, chunk_minutes=30):
+def generate_context_chunks(file_results, output_path, gap_hours=2):
     """
     Generate enriched context chunks for RAG system.
-    Groups messages into conversation blocks based on time windows.
+    Groups messages into conversation blocks based on silence gaps.
+    A new chunk is started when there's a gap of >= gap_hours between messages.
     
     Args:
         file_results: list of (filename, filepath, filetype, subject) tuples
         output_path: path to write JSON output
-        chunk_minutes: time window for grouping messages (default 30 mins)
+        gap_hours: silence gap (in hours) to start a new chunk (default 2 hours)
     """
     all_chunks = []
     chunk_id = 0
@@ -355,6 +454,8 @@ def generate_context_chunks(file_results, output_path, chunk_minutes=30):
             messages = parse_instagram_messages(filepath)
         elif filetype == 'WhatsApp':
             messages = parse_whatsapp_messages(filepath)
+        elif filetype == 'LINE':
+            messages = parse_line_messages(filepath)
         else:
             continue
         
@@ -368,17 +469,17 @@ def generate_context_chunks(file_results, output_path, chunk_minutes=30):
         partners = set(msg[1] for msg in messages if msg[1] != subject)
         partner_name = ', '.join(partners) if partners else 'Unknown'
         
-        # Group messages into time-based chunks
+        # Group messages using gap-based chunking
         current_chunk = None
-        chunk_window = timedelta(minutes=chunk_minutes)
+        silence_gap = timedelta(hours=gap_hours)
         
         for dt, sender, content in messages:
             # Skip empty or media-only
             if not content.strip() or content == '<Media omitted>':
                 continue
             
-            # Check if we need to start a new chunk
-            if current_chunk is None or (dt - current_chunk['end_time']) > chunk_window:
+            # Check if we need to start a new chunk (gap >= silence_gap)
+            if current_chunk is None or (dt - current_chunk['end_time']) >= silence_gap:
                 # Save previous chunk if exists
                 if current_chunk is not None and current_chunk['messages']:
                     # Only save if subject participated

@@ -6,6 +6,7 @@ Provides API endpoints for file upload, classification, and participant extracti
 import os
 import sys
 import uuid
+import json
 import hashlib
 from pathlib import Path
 from flask import Flask, request, jsonify
@@ -21,6 +22,12 @@ load_dotenv(ROOT_DIR / ".env")
 from processor import classify_file, extract_participants
 from instagram_zip_processor import (
     extract_zip, find_conversations, merge_conversation_messages, cleanup_zip
+)
+from discord_zip_processor import (
+    extract_zip as discord_extract_zip,
+    find_dm_conversations as discord_find_conversations,
+    convert_discord_to_instagram_format,
+    cleanup_zip as discord_cleanup_zip
 )
 
 app = Flask(__name__)
@@ -50,8 +57,108 @@ def compute_file_hash(file_path):
     return sha256_hash.hexdigest()
 
 
+def extract_message_fingerprints(file_path, n=20):
+    """
+    Extract fingerprints from first and last N messages for overlap detection.
+    Returns a set of (sender_hash, content_hash) tuples.
+    """
+    fingerprints = set()
+    
+    try:
+        detected_type = classify_file(str(file_path))
+        
+        if detected_type == 'Instagram':
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            messages = data.get('messages', [])
+            # Get boundary messages (first N and last N)
+            boundary = messages[:n] + messages[-n:]
+            for msg in boundary:
+                sender = msg.get('sender_name', '')
+                content = msg.get('content', '')
+                if content:
+                    fp = hashlib.md5(f"{sender}:{content}".encode()).hexdigest()[:12]
+                    fingerprints.add(fp)
+                    
+        elif detected_type == 'WhatsApp':
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            # Extract message lines (skip system messages)
+            import re
+            msg_pattern = r'\d{1,2}/\d{1,2}/\d{2,4},\s\d{1,2}:\d{2}.*-\s(.*?):\s(.*)$'
+            msg_lines = []
+            for line in lines:
+                match = re.match(msg_pattern, line, re.IGNORECASE)
+                if match:
+                    msg_lines.append((match.group(1), match.group(2)))
+            # Get boundary messages
+            boundary = msg_lines[:n] + msg_lines[-n:]
+            for sender, content in boundary:
+                if content:
+                    fp = hashlib.md5(f"{sender}:{content}".encode()).hexdigest()[:12]
+                    fingerprints.add(fp)
+                    
+        elif detected_type == 'LINE':
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            import re
+            line_pattern = r'^\d{1,2}:\d{2}\s*(?:[AP]M)?\t(.+?)\t(.*)$'
+            msg_lines = []
+            for line in lines:
+                match = re.match(line_pattern, line, re.IGNORECASE)
+                if match:
+                    msg_lines.append((match.group(1).strip(), match.group(2).strip()))
+            boundary = msg_lines[:n] + msg_lines[-n:]
+            for sender, content in boundary:
+                if content:
+                    fp = hashlib.md5(f"{sender}:{content}".encode()).hexdigest()[:12]
+                    fingerprints.add(fp)
+    except Exception as e:
+        print(f"Error extracting fingerprints from {file_path}: {e}")
+    
+    return fingerprints
+
+
+def get_existing_fingerprints(folder):
+    """Get fingerprints of all existing files in a folder for duplicate detection."""
+    file_fingerprints = {}
+    if not folder.exists():
+        return file_fingerprints
+    
+    for file_path in folder.iterdir():
+        if file_path.is_file() and not file_path.name.endswith('.meta.json'):
+            try:
+                fps = extract_message_fingerprints(file_path)
+                if fps:
+                    file_fingerprints[file_path.name] = fps
+            except Exception:
+                pass
+    return file_fingerprints
+
+
+def check_content_overlap(new_fingerprints, existing_fingerprints, threshold=0.8):
+    """
+    Check if new file has significant content overlap with existing files.
+    Returns (is_duplicate, matching_filename) if overlap > threshold.
+    """
+    if not new_fingerprints:
+        return False, None
+    
+    for filename, existing_fps in existing_fingerprints.items():
+        if not existing_fps:
+            continue
+        # Calculate overlap ratio
+        overlap = len(new_fingerprints & existing_fps)
+        # Use min of the two sets for ratio (handles files of different sizes)
+        min_size = min(len(new_fingerprints), len(existing_fps))
+        if min_size > 0 and overlap / min_size >= threshold:
+            return True, filename
+    
+    return False, None
+
+
 def get_existing_hashes(folder):
-    """Get hashes of all existing files in a folder."""
+    """Get hashes of all existing files in a folder (legacy, kept for compatibility)."""
     hashes = {}
     if not folder.exists():
         return hashes
@@ -73,7 +180,7 @@ def get_file_metadata(file_path):
     
     detected_type = classify_file(str(path))
     participants = []
-    if detected_type in ["WhatsApp", "Instagram"]:
+    if detected_type in ["WhatsApp", "Instagram", "LINE"]:
         participants = extract_participants(str(path), detected_type)
     
     return {
@@ -106,13 +213,19 @@ def scan_uploads_folder(file_type):
         try:
             metadata = get_file_metadata(file_path)
             
-            # Load subject from meta file if exists
+            # Load overrides from meta file if exists (for ZIP-sourced files)
             meta_file = folder / f"{metadata['id']}.meta.json"
             if meta_file.exists():
                 import json
                 with open(meta_file, 'r') as f:
                     meta_data = json.load(f)
                     metadata['subject'] = meta_data.get('subject')
+                    # Override detected_type if stored (for Discord/Instagram ZIP files)
+                    if 'detected_type' in meta_data:
+                        metadata['detected_type'] = meta_data['detected_type']
+                    # Override participants if stored
+                    if 'participants' in meta_data:
+                        metadata['participants'] = meta_data['participants']
             
             files.append(metadata)
         except Exception as e:
@@ -141,11 +254,11 @@ def upload_files(file_type):
     if not files or all(f.filename == "" for f in files):
         return jsonify({"error": "No files selected"}), 400
     
-    # Get hashes of existing files to detect duplicates
+    # Get fingerprints of existing files for content-based duplicate detection
     folder = UPLOAD_DIR / file_type
-    existing_hashes = get_existing_hashes(folder)
-    # Track hashes of newly uploaded files in this batch
-    batch_hashes = {}
+    existing_fingerprints = get_existing_fingerprints(folder)
+    # Track fingerprints of newly uploaded files in this batch
+    batch_fingerprints = {}
     
     uploaded = []
     rejected = []
@@ -173,24 +286,26 @@ def upload_files(file_type):
         # Save file temporarily to check type and hash
         file.save(str(file_path))
         
-        # Check for duplicate content
-        file_hash = compute_file_hash(file_path)
+        # Check for duplicate content using message fingerprints
+        new_fingerprints = extract_message_fingerprints(file_path)
         
-        if file_hash in existing_hashes:
-            # Duplicate of existing file
+        # Check against existing files
+        is_dup, match_file = check_content_overlap(new_fingerprints, existing_fingerprints)
+        if is_dup:
             file_path.unlink()
             rejected.append({
                 "name": file.filename,
-                "reason": "Duplicate file. This content has already been uploaded."
+                "reason": f"Duplicate content detected. Overlaps significantly with {match_file}."
             })
             continue
         
-        if file_hash in batch_hashes:
-            # Duplicate within this upload batch
+        # Check against files in this upload batch
+        is_dup_batch, match_batch = check_content_overlap(new_fingerprints, batch_fingerprints)
+        if is_dup_batch:
             file_path.unlink()
             rejected.append({
                 "name": file.filename,
-                "reason": f"Duplicate of {batch_hashes[file_hash]} in this upload."
+                "reason": f"Duplicate of {match_batch} in this upload."
             })
             continue
         
@@ -199,39 +314,94 @@ def upload_files(file_type):
             # Handle ZIP files specially
             if file_ext == '.zip':
                 try:
-                    # Extract and find conversations
-                    zip_id = file_id
-                    extracted_path = extract_zip(str(file_path), zip_id)
-                    conversations = find_conversations(extracted_path)
+                    import zipfile
                     
-                    if not conversations:
-                        # No valid Instagram conversations found
+                    # Peek into ZIP to determine type (Discord vs Instagram)
+                    zip_type = None
+                    with zipfile.ZipFile(str(file_path), 'r') as zf:
+                        names = zf.namelist()
+                        # Discord: has Messages/index.json
+                        if any('messages/index.json' in n.lower() for n in names):
+                            zip_type = 'discord'
+                        # Instagram: has your_instagram_activity/messages/inbox or messages/inbox
+                        elif any('inbox/' in n.lower() for n in names):
+                            zip_type = 'instagram'
+                    
+                    if zip_type == 'discord':
+                        # Discord ZIP - extract and find DM conversations
+                        zip_id = file_id
+                        extracted_path = discord_extract_zip(str(file_path), zip_id)
+                        conversations = discord_find_conversations(extracted_path)
+                        
+                        if not conversations:
+                            file_path.unlink()
+                            discord_cleanup_zip(zip_id)
+                            rejected.append({
+                                "name": file.filename,
+                                "reason": "No Discord DM conversations found. Make sure this is a Discord data export with direct messages."
+                            })
+                            continue
+                        
+                        # Store the ZIP info for later selection
+                        pending_zips[zip_id] = {
+                            "zip_path": str(file_path),
+                            "extracted_path": str(extracted_path),
+                            "original_name": file.filename,
+                            "conversations": conversations,
+                            "zip_type": "discord"
+                        }
+                        
+                        return jsonify({
+                            "success": True,
+                            "type": "discord_zip_upload",
+                            "zip_id": zip_id,
+                            "original_name": file.filename,
+                            "conversations": conversations,
+                            "uploaded": [],
+                            "rejected": rejected
+                        })
+                    
+                    elif zip_type == 'instagram':
+                        # Instagram ZIP - existing logic
+                        zip_id = file_id
+                        extracted_path = extract_zip(str(file_path), zip_id)
+                        conversations = find_conversations(extracted_path)
+                        
+                        if not conversations:
+                            file_path.unlink()
+                            cleanup_zip(zip_id)
+                            rejected.append({
+                                "name": file.filename,
+                                "reason": "No Instagram conversations found in ZIP. Make sure this is an Instagram data export."
+                            })
+                            continue
+                        
+                        pending_zips[zip_id] = {
+                            "zip_path": str(file_path),
+                            "extracted_path": str(extracted_path),
+                            "original_name": file.filename,
+                            "conversations": conversations,
+                            "zip_type": "instagram"
+                        }
+                        
+                        return jsonify({
+                            "success": True,
+                            "type": "zip_upload",
+                            "zip_id": zip_id,
+                            "original_name": file.filename,
+                            "conversations": conversations,
+                            "uploaded": [],
+                            "rejected": rejected
+                        })
+                    
+                    else:
+                        # Unknown ZIP format
                         file_path.unlink()
-                        cleanup_zip(zip_id)
                         rejected.append({
                             "name": file.filename,
-                            "reason": "No Instagram conversations found in ZIP. Make sure this is an Instagram data export."
+                            "reason": "Unrecognized ZIP format. Please upload Instagram or Discord data exports."
                         })
                         continue
-                    
-                    # Store the ZIP info for later selection
-                    pending_zips[zip_id] = {
-                        "zip_path": str(file_path),
-                        "extracted_path": str(extracted_path),
-                        "original_name": file.filename,
-                        "conversations": conversations
-                    }
-                    
-                    # Return special response for ZIP
-                    return jsonify({
-                        "success": True,
-                        "type": "zip_upload",
-                        "zip_id": zip_id,
-                        "original_name": file.filename,
-                        "conversations": conversations,
-                        "uploaded": [],
-                        "rejected": rejected
-                    })
                     
                 except Exception as e:
                     file_path.unlink()
@@ -243,12 +413,12 @@ def upload_files(file_type):
             
             detected_type = classify_file(str(file_path))
             
-            if detected_type not in ["WhatsApp", "Instagram"]:
+            if detected_type not in ["WhatsApp", "Instagram", "LINE"]:
                 # Delete the file and reject
                 file_path.unlink()
                 rejected.append({
                     "name": file.filename,
-                    "reason": "Not a supported chat file. Please upload WhatsApp exports (.txt), Instagram exports (.json), or Instagram ZIP exports."
+                    "reason": "Not a supported chat file. Please upload WhatsApp (.txt), Instagram (.json), LINE (.txt), or ZIP exports."
                 })
                 continue
             
@@ -266,8 +436,9 @@ def upload_files(file_type):
                 "path": str(file_path),
                 "size": file_path.stat().st_size
             })
-            # Track this file's hash for batch duplicate detection
-            batch_hashes[file_hash] = file.filename
+            # Track this file's fingerprints for batch duplicate detection
+            if new_fingerprints:
+                batch_fingerprints[file.filename] = new_fingerprints
         else:
             # Voice files - just save
             uploaded.append({
@@ -281,8 +452,9 @@ def upload_files(file_type):
                 "path": str(file_path),
                 "size": file_path.stat().st_size
             })
-            # Track this file's hash for batch duplicate detection
-            batch_hashes[file_hash] = file.filename
+            # Track this file's fingerprints for batch duplicate detection
+            if new_fingerprints:
+                batch_fingerprints[file.filename] = new_fingerprints
     
     return jsonify({
         "success": True,
@@ -296,7 +468,7 @@ def upload_files(file_type):
 @app.route("/api/files/text/zip/select", methods=["POST"])
 def select_zip_conversations():
     """
-    Select conversations from a previously uploaded ZIP file.
+    Select conversations from a previously uploaded ZIP file (Instagram or Discord).
     Request body: { "zip_id": "...", "conversations": ["folder_name1", "folder_name2"] }
     """
     import json as json_module
@@ -313,6 +485,7 @@ def select_zip_conversations():
     
     zip_info = pending_zips[zip_id]
     conversations = zip_info["conversations"]
+    zip_type = zip_info.get("zip_type", "instagram")  # Default to Instagram for backward compat
     
     # Find selected conversations by folder name
     selected_convs = [c for c in conversations if c["folder_name"] in selected_folders]
@@ -327,13 +500,19 @@ def select_zip_conversations():
     
     for conv in selected_convs:
         try:
-            # Merge all message files into one JSON
-            merged_data = merge_conversation_messages(conv["path"])
+            if zip_type == "discord":
+                # Discord: Convert to Instagram-like format
+                merged_data = convert_discord_to_instagram_format(conv["path"])
+                source_label = "Discord"
+            else:
+                # Instagram: Merge all message files
+                merged_data = merge_conversation_messages(conv["path"])
+                source_label = "Instagram"
             
             if not merged_data:
                 rejected.append({
                     "name": conv["display_name"],
-                    "reason": "Failed to merge conversation messages"
+                    "reason": "Failed to process conversation messages"
                 })
                 continue
             
@@ -367,17 +546,28 @@ def select_zip_conversations():
                         pass
                     participants.append(name)
             
+            detected_type = "Discord" if zip_type == "discord" else "Instagram"
+            
             uploaded.append({
                 "id": file_id,
-                "original_name": f"{conv['display_name']} (from ZIP)",
+                "original_name": f"{conv['display_name']} (from {source_label} ZIP)",
                 "saved_as": file_name,
                 "file_type": "text",
-                "detected_type": "Instagram",
+                "detected_type": detected_type,
                 "participants": participants,
                 "subject": None,
                 "path": str(file_path),
                 "size": file_path.stat().st_size
             })
+            
+            # Save meta file with detected_type and participants so it persists on rescan
+            meta_path = UPLOAD_DIR / "text" / f"{file_id}.meta.json"
+            with open(meta_path, 'w') as f:
+                json.dump({
+                    "detected_type": detected_type,
+                    "participants": participants,
+                    "original_name": conv['display_name']
+                }, f)
             
         except Exception as e:
             rejected.append({
@@ -390,20 +580,42 @@ def select_zip_conversations():
         zip_path = Path(zip_info["zip_path"])
         if zip_path.exists():
             zip_path.unlink()
-        cleanup_zip(zip_id)
+        # Use appropriate cleanup function
+        if zip_type == "discord":
+            discord_cleanup_zip(zip_id)
+        else:
+            cleanup_zip(zip_id)
     except Exception as e:
         print(f"Cleanup error: {e}")
     
     # Remove from pending
     del pending_zips[zip_id]
     
-    return jsonify({
+    # Collect any warnings from merged_data
+    warnings = []
+    for item in uploaded:
+        # Check if there was a warning stored in the last merged_data processing
+        # (we'll need to track this separately)
+        pass
+    
+    response = {
         "success": True,
         "uploaded": uploaded,
         "rejected": rejected,
         "uploaded_count": len(uploaded),
         "rejected_count": len(rejected)
-    })
+    }
+    
+    # Add Discord warning if applicable
+    if zip_type == "discord" and uploaded:
+        response["warning"] = (
+            "⚠️ This Discord export uses an older format without sender information. "
+            "All messages appear as 'Discord_User'. For proper AI training, request a new "
+            "data export from Discord (privacy settings) which includes Author data."
+        )
+    
+    return jsonify(response)
+
 
 @app.route("/api/files/<file_type>", methods=["GET"])
 def list_files(file_type):
@@ -433,7 +645,7 @@ def get_participants(file_type, file_id):
     file_path = matching_files[0]
     detected_type = classify_file(str(file_path))
     participants = []
-    if detected_type in ["WhatsApp", "Instagram"]:
+    if detected_type in ["WhatsApp", "Instagram", "LINE"]:
         participants = extract_participants(str(file_path), detected_type)
     
     return jsonify({
