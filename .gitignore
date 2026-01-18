@@ -44,6 +44,11 @@ backend/data/debug_*.bin
 backend/data/*.log
 backend/data/debug_*.log
 
+# Backend - Runtime data (user sessions, messages)
+backend/data/messages.json
+backend/data/sessions.json
+backend/data/settings.json
+
 # Backend - Voice Testing folder (development/testing only)
 backend/Voice Testing/
 backend/voices/
