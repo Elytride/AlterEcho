@@ -167,6 +167,91 @@ def save_settings():
     save_json(SETTINGS_FILE, settings_db)
 
 
+# --- Knowledge Base & Context Helpers ---
+def load_knowledge_base() -> str:
+    """
+    Load all text files from the knowledge base to include in AI context.
+    Returns concatenated content from all uploaded text files.
+    """
+    knowledge_content = []
+    text_folder = UPLOAD_DIR / "text"
+    
+    if not text_folder.exists():
+        return ""
+    
+    for file_path in text_folder.iterdir():
+        if file_path.is_file():
+            try:
+                # Try common text encodings
+                content = None
+                for encoding in ['utf-8', 'utf-16', 'latin-1']:
+                    try:
+                        with open(file_path, "r", encoding=encoding) as f:
+                            content = f.read()
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                
+                if content:
+                    # Limit each file to ~2000 chars to avoid token limits
+                    if len(content) > 2000:
+                        content = content[:2000] + "\n... [truncated]"
+                    knowledge_content.append(f"=== {file_path.name} ===\n{content}")
+            except Exception as e:
+                print(f"Warning: Could not read {file_path}: {e}")
+    
+    if not knowledge_content:
+        return ""
+    
+    return "\n\n".join(knowledge_content)
+
+
+def build_conversation_context(session_id: str, max_history: int = 10) -> str:
+    """
+    Build conversation history context for the AI.
+    Returns formatted string of recent messages.
+    """
+    messages = messages_db.get(session_id, [])
+    if not messages:
+        return ""
+    
+    # Get last N messages
+    recent = messages[-max_history:]
+    
+    context_parts = []
+    for msg in recent:
+        role = "User" if msg["role"] == "user" else "You"
+        context_parts.append(f"{role}: {msg['content']}")
+    
+    return "\n".join(context_parts)
+
+
+def build_full_prompt(session_id: str, user_message: str, system_prompt: str) -> str:
+    """
+    Build the complete prompt including:
+    1. System prompt (personality)
+    2. Knowledge base content
+    3. Conversation history
+    4. Current user message
+    """
+    parts = [system_prompt]
+    
+    # Add knowledge base if available
+    knowledge = load_knowledge_base()
+    if knowledge:
+        parts.append(f"\n\n=== KNOWLEDGE BASE (Use this information to inform your responses) ===\n{knowledge}\n=== END KNOWLEDGE BASE ===")
+    
+    # Add conversation history
+    history = build_conversation_context(session_id, max_history=10)
+    if history:
+        parts.append(f"\n\n=== CONVERSATION HISTORY ===\n{history}\n=== END HISTORY ===")
+    
+    # Add current message
+    parts.append(f"\n\nUser: {user_message}\n\nRespond naturally while staying in character. Use knowledge from the knowledge base when relevant:")
+    
+    return "".join(parts)
+
+
 # --- Models ---
 class ChatMessage(BaseModel):
     content: str
@@ -214,11 +299,10 @@ async def send_message(message: ChatMessage):
         system_prompt = session.get("system_prompt", "You are a helpful AI assistant.")
         
         model = get_gemini_model()
-        chat = model.start_chat(history=[])
         
-        # Build conversation context
-        full_prompt = f"{system_prompt}\n\nUser: {message.content}\n\nRespond naturally:"
-        response = chat.send_message(full_prompt)
+        # Build full prompt with knowledge base and chat history
+        full_prompt = build_full_prompt(session_id, message.content, system_prompt)
+        response = model.generate_content(full_prompt)
         ai_response = response.text
     except Exception as e:
         print(f"Gemini error: {e}")
@@ -249,17 +333,36 @@ async def stream_voice_call(message: CallMessage):
     """
     Voice call endpoint with streaming response.
     Returns SSE stream with text and audio chunks for lowest latency.
+    Now also saves conversation to chat history and uses knowledge base.
     """
     session_id = message.session_id
     session = sessions_db.get(session_id, {})
     system_prompt = session.get("system_prompt", "You are a helpful AI assistant. Keep responses very brief.")
     voice_name = session.get("voice", "test_voice")
     
+    # Initialize messages list for this session if needed
+    if session_id not in messages_db:
+        messages_db[session_id] = []
+    
+    # Save user message to chat history FIRST (before generating response)
+    timestamp = datetime.now().strftime("%I:%M %p")
+    user_msg = {
+        "id": f"msg-{uuid.uuid4().hex[:8]}",
+        "role": "user",
+        "content": message.content,
+        "timestamp": timestamp,
+        "source": "voice"  # Mark as voice message
+    }
+    messages_db[session_id].append(user_msg)
+    save_messages()
+    
     async def generate_stream():
         try:
-            # Step 1: Get Gemini response (fast)
+            # Step 1: Build full prompt with knowledge base and chat history
             model = get_gemini_model()
-            full_prompt = f"{system_prompt}\n\nUser: {message.content}\n\nRespond naturally and briefly:"
+            # Use the same prompt builder, but add "Keep responses brief" for voice
+            voice_system_prompt = system_prompt + " Keep your responses concise and natural for spoken conversation."
+            full_prompt = build_full_prompt(session_id, message.content, voice_system_prompt)
             
             # Use streaming for text
             response = model.generate_content(full_prompt, stream=True)
@@ -271,7 +374,24 @@ async def stream_voice_call(message: CallMessage):
                     full_text += chunk.text
                     yield f"data: {json.dumps({'type': 'text', 'content': chunk.text})}\n\n"
             
-            # Step 2: Generate voice from complete text using WaveSpeed
+            # Step 2: Save AI response to chat history
+            ai_msg = {
+                "id": f"msg-{uuid.uuid4().hex[:8]}",
+                "role": "assistant",
+                "content": full_text,
+                "timestamp": datetime.now().strftime("%I:%M %p"),
+                "source": "voice"  # Mark as voice message
+            }
+            messages_db[session_id].append(ai_msg)
+            
+            # Update session preview
+            if session_id in sessions_db:
+                sessions_db[session_id]["preview"] = message.content[:30] + "..."
+            
+            save_sessions()
+            save_messages()
+            
+            # Step 3: Generate voice from complete text using WaveSpeed
             yield f"data: {json.dumps({'type': 'status', 'content': 'generating_voice'})}\n\n"
             
             # Check if WaveSpeed is configured and session has a voice
@@ -290,6 +410,7 @@ async def stream_voice_call(message: CallMessage):
                         
                     # Update last_used_at to extend expiration
                     session["voice_last_used_at"] = datetime.now().isoformat()
+                    save_sessions()
                 except Exception as voice_err:
                     print(f"WaveSpeed voice error: {voice_err}")
                     yield f"data: {json.dumps({'type': 'status', 'content': 'voice_error'})}\n\n"

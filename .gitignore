@@ -11,7 +11,6 @@ node_modules
 dist
 dist-ssr
 *.local
-.env
 
 # Editor directories and files
 .vscode/*
@@ -24,17 +23,47 @@ dist-ssr
 *.sln
 *.sw?
 
+# Environment files (contain secrets)
+.env
+*.env.local
+
+# Backend - User data & uploads (generated at runtime)
 backend/uploads/
 backend/preprocessed/
 backend/chats/
-backend/__pycache__
+backend/__pycache__/
+backend/temp_zip/
 
-.env
-backend/credentials/*
-backend/Voice Testing/ffmpeg.exe
-backend/Voice Testing/ffprobe.exe
-
-test_prediction.py
-
-# Encrypted API keys (never commit)
+# Backend - Credentials & secrets (never commit)
+backend/credentials/
 backend/.secrets/
+
+# Backend - Debug & temporary files
+backend/data/debug_*.json
+backend/data/debug_*.bin
+backend/data/*.log
+backend/data/debug_*.log
+
+# Backend - Voice Testing folder (development/testing only)
+backend/Voice Testing/
+backend/voices/
+
+# Python
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.eggs/
+
+# Test files
+test_*.py
+*_test.py
+
+# Misc junk
+nul
+*.tmp
+*.bak
+*.swp
+Thumbs.db
