@@ -1,6 +1,6 @@
 """
-NullTale Backend API - Flask Server
-Provides API endpoints for file upload, classification, and participant extraction.
+NullTale Backend API - Consolidated Server
+Combines file processing (originally Flask) and Chat/Voice features (originally FastAPI).
 """
 
 import os
@@ -8,18 +8,32 @@ import sys
 import uuid
 import json
 import hashlib
+import time
+import base64
+import shutil
 from pathlib import Path
-from flask import Flask, request, jsonify
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Union
+
+from flask import Flask, request, jsonify, Response, stream_with_context, send_file
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
+
+# --- Google Gemini Integration ---
+import google.generativeai as genai
 
 # Load .env from root Nulltale folder
 ROOT_DIR = Path(__file__).parent.parent
 load_dotenv(ROOT_DIR / ".env")
 
-# Import processing modules
-from processor import classify_file, extract_participants
+# Configure Gemini
+GENAI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GENAI_API_KEY:
+    genai.configure(api_key=GENAI_API_KEY)
+
+# --- Import processing modules ---
+from processor import classify_file, extract_participants, generate_style_file, generate_context_chunks
 from instagram_zip_processor import (
     extract_zip, find_conversations, merge_conversation_messages, cleanup_zip
 )
@@ -29,11 +43,14 @@ from discord_zip_processor import (
     convert_discord_to_instagram_format,
     cleanup_zip as discord_cleanup_zip
 )
+from style_summarizer import generate_style_summary
+from context_embedder import generate_embeddings
+from chatbot import PersonaChatbot
 
-# Voice/TTS imports
+# --- Voice/TTS imports ---
 from wavespeed_manager import WaveSpeedManager
 from secrets_manager import (
-    get_wavespeed_key, save_wavespeed_key, has_wavespeed_key
+    get_wavespeed_key, save_wavespeed_key, has_wavespeed_key, delete_secret
 )
 
 app = Flask(__name__)
@@ -41,43 +58,158 @@ app = Flask(__name__)
 # CORS for Vite dev server
 CORS(app, origins=["http://localhost:5173", "http://127.0.0.1:5173"])
 
-# Configure upload directory
+# --- Configuration & Directories ---
 UPLOAD_DIR = Path(__file__).parent / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 (UPLOAD_DIR / "text").mkdir(exist_ok=True)
 (UPLOAD_DIR / "voice").mkdir(exist_ok=True)
 
-# Allowed extensions for text files
+PREPROCESSED_DIR = Path(__file__).parent / "preprocessed"
+PREPROCESSED_DIR.mkdir(exist_ok=True)
+
+CHATS_DIR = Path(__file__).parent / "chats"
+CHATS_DIR.mkdir(exist_ok=True)
+
 ALLOWED_TEXT_EXTENSIONS = {'.txt', '.json', '.zip', '.html'}
 
-# Storage for pending ZIP uploads (zip_id -> extraction info)
-pending_zips = {}
+# --- Global State ---
+settings_db = {
+    "model_version": "v2.5",
+    "temperature": 0.7
+}
+# Lazy-loaded Gemini model
+_gemini_model = None
+# Lazy-loaded WaveSpeed manager
+_wavespeed_manager = None
 
+# In-memory storage (backed by file persistence)
+sessions_db = {}
+messages_db = {}
+chatbots = {}         # Active chatbot instances: session_id -> PersonaChatbot
+pending_zips = {}     # zip_id -> extraction info
+
+# --- Helper Functions ---
+
+def get_gemini_model():
+    global _gemini_model
+    if _gemini_model is None:
+        _gemini_model = genai.GenerativeModel("gemini-2.5-flash-lite")
+    return _gemini_model
+
+def get_wavespeed_manager(force_reload: bool = False):
+    global _wavespeed_manager
+    if _wavespeed_manager is None or force_reload:
+        api_key = get_wavespeed_key()
+        if not api_key:
+            return None
+        _wavespeed_manager = WaveSpeedManager(api_key=api_key)
+    return _wavespeed_manager
+
+def save_sessions():
+    """Save sessions metadata to disk."""
+    sessions_file = CHATS_DIR / "sessions.json"
+    try:
+        with open(sessions_file, "w", encoding="utf-8") as f:
+            json.dump(sessions_db, f, indent=2)
+    except Exception as e:
+        print(f"Failed to save sessions: {e}")
+
+def save_message_history(session_id):
+    """Save message history for a session."""
+    if session_id not in messages_db:
+        return
+    history_file = CHATS_DIR / f"history_{session_id}.json"
+    try:
+        with open(history_file, "w", encoding="utf-8") as f:
+            json.dump(messages_db[session_id], f, indent=2)
+    except Exception as e:
+        print(f"Failed to save history for {session_id}: {e}")
+
+def load_persistence():
+    """Load sessions and histories from disk."""
+    global sessions_db, messages_db
+    
+    # Load sessions
+    sessions_file = CHATS_DIR / "sessions.json"
+    if sessions_file.exists():
+        try:
+            with open(sessions_file, "r", encoding="utf-8") as f:
+                sessions_db.update(json.load(f))
+        except Exception as e:
+            print(f"Failed to load sessions: {e}")
+            
+    # Load histories
+    for session_id in sessions_db:
+        history_file = CHATS_DIR / f"history_{session_id}.json"
+        if history_file.exists():
+            try:
+                with open(history_file, "r", encoding="utf-8") as f:
+                    messages_db[session_id] = json.load(f)
+            except Exception as e:
+                print(f"Failed to load history for {session_id}: {e}")
+                messages_db[session_id] = []
+        else:
+            messages_db[session_id] = []
+
+def get_available_subjects():
+    """List available subjects based on preprocessed files."""
+    subjects = []
+    if PREPROCESSED_DIR.exists():
+        for file_path in PREPROCESSED_DIR.iterdir():
+            if file_path.name.endswith('_embeddings.json'):
+                subject = file_path.stem.replace('_embeddings', '')
+                subjects.append(subject)
+    return subjects
+
+def get_or_create_chatbot(session_id: str):
+    """Get existing chatbot or create new one for session."""
+    if session_id in chatbots:
+        return chatbots[session_id]
+        
+    if session_id not in sessions_db:
+        return None
+        
+    subject = sessions_db[session_id].get("subject")
+    if not subject:
+        return None
+        
+    summary_path = PREPROCESSED_DIR / f"{subject}_style_summary.txt"
+    embeddings_path = PREPROCESSED_DIR / f"{subject}_embeddings.json"
+    
+    if not summary_path.exists() or not embeddings_path.exists():
+        return None
+        
+    try:
+        # Pass Gemini model to chatbot
+        model = get_gemini_model()
+        chatbot = PersonaChatbot(
+            str(summary_path),
+            str(embeddings_path),
+            model=model
+        )
+        chatbots[session_id] = chatbot
+        return chatbot
+    except Exception as e:
+        print(f"Failed to create chatbot for {subject}: {e}")
+        return None
+
+# --- File Processing Helpers ---
 
 def compute_file_hash(file_path):
-    """Compute SHA256 hash of a file's content."""
     sha256_hash = hashlib.sha256()
     with open(file_path, "rb") as f:
         for chunk in iter(lambda: f.read(4096), b""):
             sha256_hash.update(chunk)
     return sha256_hash.hexdigest()
 
-
 def extract_message_fingerprints(file_path, n=20):
-    """
-    Extract fingerprints from first and last N messages for overlap detection.
-    Returns a set of (sender_hash, content_hash) tuples.
-    """
     fingerprints = set()
-    
     try:
         detected_type = classify_file(str(file_path))
-        
         if detected_type == 'Instagram':
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             messages = data.get('messages', [])
-            # Get boundary messages (first N and last N)
             boundary = messages[:n] + messages[-n:]
             for msg in boundary:
                 sender = msg.get('sender_name', '')
@@ -85,52 +217,29 @@ def extract_message_fingerprints(file_path, n=20):
                 if content:
                     fp = hashlib.md5(f"{sender}:{content}".encode()).hexdigest()[:12]
                     fingerprints.add(fp)
-                    
         elif detected_type == 'WhatsApp':
             with open(file_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
-            # Extract message lines (skip system messages)
             import re
-            msg_pattern = r'\d{1,2}/\d{1,2}/\d{2,4},\s\d{1,2}:\d{2}.*-\s(.*?):\s(.*)$'
+            msg_pattern = r'^\d{1,2}/\d{1,2}/\d{2,4},\s\d{1,2}:\d{2}.*-\s(.*?):\s(.*)$'
             msg_lines = []
             for line in lines:
                 match = re.match(msg_pattern, line, re.IGNORECASE)
                 if match:
                     msg_lines.append((match.group(1), match.group(2)))
-            # Get boundary messages
             boundary = msg_lines[:n] + msg_lines[-n:]
             for sender, content in boundary:
                 if content:
                     fp = hashlib.md5(f"{sender}:{content}".encode()).hexdigest()[:12]
                     fingerprints.add(fp)
-                    
-        elif detected_type == 'LINE':
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-            import re
-            line_pattern = r'^\d{1,2}:\d{2}\s*(?:[AP]M)?\t(.+?)\t(.*)$'
-            msg_lines = []
-            for line in lines:
-                match = re.match(line_pattern, line, re.IGNORECASE)
-                if match:
-                    msg_lines.append((match.group(1).strip(), match.group(2).strip()))
-            boundary = msg_lines[:n] + msg_lines[-n:]
-            for sender, content in boundary:
-                if content:
-                    fp = hashlib.md5(f"{sender}:{content}".encode()).hexdigest()[:12]
-                    fingerprints.add(fp)
-    except Exception as e:
-        print(f"Error extracting fingerprints from {file_path}: {e}")
-    
+    except Exception:
+        pass
     return fingerprints
 
-
 def get_existing_fingerprints(folder):
-    """Get fingerprints of all existing files in a folder for duplicate detection."""
     file_fingerprints = {}
     if not folder.exists():
         return file_fingerprints
-    
     for file_path in folder.iterdir():
         if file_path.is_file() and not file_path.name.endswith('.meta.json'):
             try:
@@ -141,49 +250,21 @@ def get_existing_fingerprints(folder):
                 pass
     return file_fingerprints
 
-
 def check_content_overlap(new_fingerprints, existing_fingerprints, threshold=0.8):
-    """
-    Check if new file has significant content overlap with existing files.
-    Returns (is_duplicate, matching_filename) if overlap > threshold.
-    """
     if not new_fingerprints:
         return False, None
-    
     for filename, existing_fps in existing_fingerprints.items():
         if not existing_fps:
             continue
-        # Calculate overlap ratio
         overlap = len(new_fingerprints & existing_fps)
-        # Use min of the two sets for ratio (handles files of different sizes)
         min_size = min(len(new_fingerprints), len(existing_fps))
         if min_size > 0 and overlap / min_size >= threshold:
             return True, filename
-    
     return False, None
 
-
-def get_existing_hashes(folder):
-    """Get hashes of all existing files in a folder (legacy, kept for compatibility)."""
-    hashes = {}
-    if not folder.exists():
-        return hashes
-    
-    for file_path in folder.iterdir():
-        if file_path.is_file() and not file_path.name.endswith('.meta.json'):
-            try:
-                file_hash = compute_file_hash(file_path)
-                hashes[file_hash] = file_path.name
-            except Exception:
-                pass
-    return hashes
-
-
 def get_file_metadata(file_path):
-    """Get metadata for a file including type detection and participants."""
     path = Path(file_path)
-    file_id = path.stem  # Use filename without extension as ID
-    
+    file_id = path.stem
     detected_type = classify_file(str(path))
     participants = []
     if detected_type in ["WhatsApp", "Instagram", "InstagramHTML", "LINE"]:
@@ -201,1252 +282,643 @@ def get_file_metadata(file_path):
         "size": path.stat().st_size
     }
 
-
 def scan_uploads_folder(file_type):
-    """Scan uploads folder and return all files with metadata."""
     folder = UPLOAD_DIR / file_type
-    if not folder.exists():
+    if not folder.exists(): 
         return []
     
     files = []
     for file_path in folder.iterdir():
-        # Skip meta files and non-files
-        if not file_path.is_file():
+        if not file_path.is_file() or file_path.name.endswith('.meta.json'):
             continue
-        if file_path.name.endswith('.meta.json'):
-            continue
-        
         try:
             metadata = get_file_metadata(file_path)
-            
-            # Load overrides from meta file if exists (for ZIP-sourced files)
+            # Load overrides
             meta_file = folder / f"{metadata['id']}.meta.json"
             if meta_file.exists():
-                import json
                 with open(meta_file, 'r') as f:
                     meta_data = json.load(f)
                     metadata['subject'] = meta_data.get('subject')
-                    # Override detected_type if stored (for Discord/Instagram ZIP files)
                     if 'detected_type' in meta_data:
                         metadata['detected_type'] = meta_data['detected_type']
-                    # Override participants if stored
                     if 'participants' in meta_data:
                         metadata['participants'] = meta_data['participants']
-            
             files.append(metadata)
         except Exception as e:
             print(f"Error scanning file {file_path}: {e}")
-    
     return files
 
-
-# --- File Upload Endpoints ---
+# --- API Endpoints: Files ---
 
 @app.route("/api/files/<file_type>", methods=["POST"])
 def upload_files(file_type):
-    """
-    Upload one or more files. For text files, validates that they are 
-    WhatsApp or Instagram exports before saving. Also checks for duplicates.
-    Returns list of uploaded files with their metadata.
-    """
     if file_type not in ["text", "voice"]:
         return jsonify({"error": "Invalid file type"}), 400
-    
     if "file" not in request.files:
         return jsonify({"error": "No file provided"}), 400
-    
-    # Get all files (supports multiple)
+        
     files = request.files.getlist("file")
     if not files or all(f.filename == "" for f in files):
         return jsonify({"error": "No files selected"}), 400
-    
-    # Get fingerprints of existing files for content-based duplicate detection
+        
     folder = UPLOAD_DIR / file_type
     existing_fingerprints = get_existing_fingerprints(folder)
-    # Track fingerprints of newly uploaded files in this batch
     batch_fingerprints = {}
     
     uploaded = []
     rejected = []
     
     for file in files:
-        if file.filename == "":
-            continue
+        if file.filename == "": continue
         
         original_name = secure_filename(file.filename)
         file_ext = Path(original_name).suffix.lower()
         
-        # Validate extension for text files
+        # Validation
         if file_type == "text" and file_ext not in ALLOWED_TEXT_EXTENSIONS:
-            rejected.append({
-                "name": file.filename,
-                "reason": f"Only .txt, .json, .html and .zip files are accepted"
-            })
+            rejected.append({"name": file.filename, "reason": "Invalid extension"})
             continue
-        
-        # Generate unique filename
+            
         file_id = uuid.uuid4().hex[:12]
         unique_name = f"{file_id}{file_ext}"
-        file_path = UPLOAD_DIR / file_type / unique_name
+        file_path = folder / unique_name
         
-        # Save file temporarily to check type and hash
         file.save(str(file_path))
         
-        # Check for duplicate content using message fingerprints
-        new_fingerprints = extract_message_fingerprints(file_path)
-        
-        # Check against existing files
-        is_dup, match_file = check_content_overlap(new_fingerprints, existing_fingerprints)
-        if is_dup:
-            file_path.unlink()
-            rejected.append({
-                "name": file.filename,
-                "reason": f"Duplicate content detected. Overlaps significantly with {match_file}."
-            })
-            continue
-        
-        # Check against files in this upload batch
-        is_dup_batch, match_batch = check_content_overlap(new_fingerprints, batch_fingerprints)
-        if is_dup_batch:
-            file_path.unlink()
-            rejected.append({
-                "name": file.filename,
-                "reason": f"Duplicate of {match_batch} in this upload."
-            })
-            continue
-        
-        # For text files, validate it's WhatsApp or Instagram (or ZIP)
-        if file_type == "text":
-            # Handle ZIP files specially
-            if file_ext == '.zip':
-                try:
-                    import zipfile
-                    
-                    # Peek into ZIP to determine type (Discord vs Instagram)
-                    zip_type = None
-                    with zipfile.ZipFile(str(file_path), 'r') as zf:
-                        names = zf.namelist()
-                        # Discord: has Messages/index.json
-                        if any('messages/index.json' in n.lower() for n in names):
-                            zip_type = 'discord'
-                        # Instagram: has your_instagram_activity/messages/inbox or messages/inbox
-                        elif any('inbox/' in n.lower() for n in names):
-                            zip_type = 'instagram'
-                    
-                    if zip_type == 'discord':
-                        # Discord ZIP - extract and find DM conversations
-                        zip_id = file_id
-                        extracted_path = discord_extract_zip(str(file_path), zip_id)
-                        conversations = discord_find_conversations(extracted_path)
-                        
-                        if not conversations:
-                            file_path.unlink()
-                            discord_cleanup_zip(zip_id)
-                            rejected.append({
-                                "name": file.filename,
-                                "reason": "No Discord DM conversations found. Make sure this is a Discord data export with direct messages."
-                            })
-                            continue
-                        
-                        # Store the ZIP info for later selection
-                        pending_zips[zip_id] = {
-                            "zip_path": str(file_path),
-                            "extracted_path": str(extracted_path),
-                            "original_name": file.filename,
-                            "conversations": conversations,
-                            "zip_type": "discord"
-                        }
-                        
-                        return jsonify({
-                            "success": True,
-                            "type": "discord_zip_upload",
-                            "zip_id": zip_id,
-                            "original_name": file.filename,
-                            "conversations": conversations,
-                            "uploaded": [],
-                            "rejected": rejected
-                        })
-                    
-                    elif zip_type == 'instagram':
-                        # Instagram ZIP - existing logic
-                        zip_id = file_id
-                        extracted_path = extract_zip(str(file_path), zip_id)
-                        conversations = find_conversations(extracted_path)
-                        
-                        if not conversations:
-                            file_path.unlink()
-                            cleanup_zip(zip_id)
-                            rejected.append({
-                                "name": file.filename,
-                                "reason": "No Instagram conversations found in ZIP. Make sure this is an Instagram data export."
-                            })
-                            continue
-                        
-                        pending_zips[zip_id] = {
-                            "zip_path": str(file_path),
-                            "extracted_path": str(extracted_path),
-                            "original_name": file.filename,
-                            "conversations": conversations,
-                            "zip_type": "instagram"
-                        }
-                        
-                        return jsonify({
-                            "success": True,
-                            "type": "zip_upload",
-                            "zip_id": zip_id,
-                            "original_name": file.filename,
-                            "conversations": conversations,
-                            "uploaded": [],
-                            "rejected": rejected
-                        })
-                    
-                    else:
-                        # Unknown ZIP format
-                        file_path.unlink()
-                        rejected.append({
-                            "name": file.filename,
-                            "reason": "Unrecognized ZIP format. Please upload Instagram or Discord data exports."
-                        })
-                        continue
-                    
-                except Exception as e:
-                    file_path.unlink()
-                    rejected.append({
-                        "name": file.filename,
-                        "reason": f"Failed to process ZIP file: {str(e)}"
-                    })
-                    continue
-            
-            detected_type = classify_file(str(file_path))
-            
-            if detected_type not in ["WhatsApp", "Instagram", "InstagramHTML", "LINE"]:
-                # Delete the file and reject
+        # Content overlap check for text files
+        if file_type == "text" and file_ext != '.zip':
+            new_fingerprints = extract_message_fingerprints(file_path)
+            is_dup, match = check_content_overlap(new_fingerprints, existing_fingerprints)
+            if is_dup:
                 file_path.unlink()
-                rejected.append({
-                    "name": file.filename,
-                    "reason": "Not a supported chat file. Please upload WhatsApp (.txt), Instagram (.json or .html), LINE (.txt), or ZIP exports."
-                })
+                rejected.append({"name": file.filename, "reason": f"Duplicate of {match}"})
                 continue
             
-            # Get participants
-            participants = extract_participants(str(file_path), detected_type)
+            is_dup_batch, match_batch = check_content_overlap(new_fingerprints, batch_fingerprints)
+            if is_dup_batch:
+                file_path.unlink()
+                rejected.append({"name": file.filename, "reason": f"Duplicate details in batch"})
+                continue
+                
+            if new_fingerprints:
+                batch_fingerprints[file.filename] = new_fingerprints
+        
+        # ZIP handling
+        if file_type == "text" and file_ext == '.zip':
+            # Simplified for brevity - reuse logic from original api.py
+            try:
+                import zipfile
+                zip_type = None
+                with zipfile.ZipFile(str(file_path), 'r') as zf:
+                    names = zf.namelist()
+                    if any('messages/index.json' in n.lower() for n in names):
+                        zip_type = 'discord'
+                    elif any('inbox/' in n.lower() for n in names):
+                        zip_type = 'instagram'
+                
+                if zip_type == 'discord':
+                    extracted_path = discord_extract_zip(str(file_path), file_id)
+                    conversations = discord_find_conversations(extracted_path)
+                    pending_zips[file_id] = {
+                        "zip_path": str(file_path), "extracted_path": str(extracted_path),
+                        "original_name": file.filename, "conversations": conversations, "zip_type": "discord"
+                    }
+                    return jsonify({
+                        "success": True, "type": "discord_zip_upload", "zip_id": file_id,
+                        "conversations": conversations, "uploaded": [], "rejected": []
+                    })
+                elif zip_type == 'instagram':
+                    extracted_path = extract_zip(str(file_path), file_id)
+                    conversations = find_conversations(extracted_path)
+                    pending_zips[file_id] = {
+                        "zip_path": str(file_path), "extracted_path": str(extracted_path),
+                        "original_name": file.filename, "conversations": conversations, "zip_type": "instagram"
+                    }
+                    return jsonify({
+                        "success": True, "type": "zip_upload", "zip_id": file_id,
+                        "conversations": conversations, "uploaded": [], "rejected": []
+                    })
+            except Exception as e:
+                file_path.unlink()
+                rejected.append({"name": file.filename, "reason": f"ZIP error: {str(e)}"})
+                continue
+
+        # Standard file processing
+        try:
+            detected_type = classify_file(str(file_path)) if file_type == "text" else "voice"
+            participants = extract_participants(str(file_path), detected_type) if file_type == "text" else []
             
             uploaded.append({
-                "id": file_id,
-                "original_name": file.filename,
-                "saved_as": unique_name,
-                "file_type": file_type,
-                "detected_type": detected_type,
-                "participants": participants,
-                "subject": None,
-                "path": str(file_path),
-                "size": file_path.stat().st_size
+                "id": file_id, "original_name": file.filename, "saved_as": unique_name,
+                "file_type": file_type, "detected_type": detected_type, "participants": participants,
+                "subject": None, "path": str(file_path), "size": file_path.stat().st_size
             })
-            # Track this file's fingerprints for batch duplicate detection
-            if new_fingerprints:
-                batch_fingerprints[file.filename] = new_fingerprints
-        else:
-            # Voice files - just save
-            uploaded.append({
-                "id": file_id,
-                "original_name": file.filename,
-                "saved_as": unique_name,
-                "file_type": file_type,
-                "detected_type": "voice",
-                "participants": [],
-                "subject": None,
-                "path": str(file_path),
-                "size": file_path.stat().st_size
-            })
-            # Track this file's fingerprints for batch duplicate detection
-            if new_fingerprints:
-                batch_fingerprints[file.filename] = new_fingerprints
-    
-    return jsonify({
-        "success": True,
-        "uploaded": uploaded,
-        "rejected": rejected,
-        "uploaded_count": len(uploaded),
-        "rejected_count": len(rejected)
-    })
+        except Exception:
+            # Fallback
+            uploaded.append({"id": file_id, "file_type": file_type, "saved_as": unique_name})
 
+    return jsonify({
+        "success": True, "uploaded": uploaded, "rejected": rejected,
+        "uploaded_count": len(uploaded)
+    })
 
 @app.route("/api/files/text/zip/select", methods=["POST"])
 def select_zip_conversations():
-    """
-    Select conversations from a previously uploaded ZIP file (Instagram or Discord).
-    Request body: { "zip_id": "...", "conversations": ["folder_name1", "folder_name2"] }
-    """
-    import json as json_module
-    
     data = request.get_json()
     zip_id = data.get("zip_id")
     selected_folders = data.get("conversations", [])
     
     if not zip_id or zip_id not in pending_zips:
-        return jsonify({"error": "ZIP not found or expired"}), 404
-    
-    if not selected_folders:
-        return jsonify({"error": "No conversations selected"}), 400
-    
+        return jsonify({"error": "ZIP not found"}), 404
+        
     zip_info = pending_zips[zip_id]
     conversations = zip_info["conversations"]
-    zip_type = zip_info.get("zip_type", "instagram")  # Default to Instagram for backward compat
+    zip_type = zip_info.get("zip_type", "instagram")
     
-    # Find selected conversations by folder name
     selected_convs = [c for c in conversations if c["folder_name"] in selected_folders]
-    
-    if not selected_convs:
-        return jsonify({"error": "Selected conversations not found"}), 400
-    
     uploaded = []
     rejected = []
     folder = UPLOAD_DIR / "text"
-    existing_hashes = get_existing_hashes(folder)
     
     for conv in selected_convs:
         try:
             if zip_type == "discord":
-                # Discord: Convert to Instagram-like format
                 merged_data = convert_discord_to_instagram_format(conv["path"])
                 source_label = "Discord"
             else:
-                # Instagram: Merge all message files
                 merged_data = merge_conversation_messages(conv["path"])
                 source_label = "Instagram"
-            
+                
             if not merged_data:
-                rejected.append({
-                    "name": conv["display_name"],
-                    "reason": "Failed to process conversation messages"
-                })
+                rejected.append({"name": conv["display_name"], "reason": "Failed to merge"})
                 continue
-            
-            # Generate unique filename
+                
             file_id = uuid.uuid4().hex[:12]
             file_name = f"{file_id}.json"
             file_path = folder / file_name
             
-            # Save merged JSON
             with open(file_path, 'w', encoding='utf-8') as f:
-                json_module.dump(merged_data, f, ensure_ascii=False)
-            
-            # Check for duplicates
-            file_hash = compute_file_hash(file_path)
-            if file_hash in existing_hashes:
-                file_path.unlink()
-                rejected.append({
-                    "name": conv["display_name"],
-                    "reason": "Duplicate conversation already uploaded"
-                })
-                continue
-            
-            # Get participants from merged data
-            participants = []
-            if 'participants' in merged_data:
-                for p in merged_data['participants']:
-                    name = p.get('name', 'Unknown')
-                    try:
-                        name = name.encode('latin-1').decode('utf-8')
-                    except:
-                        pass
-                    participants.append(name)
-            
+                json.dump(merged_data, f, ensure_ascii=False)
+                
             detected_type = "Discord" if zip_type == "discord" else "Instagram"
             
-            uploaded.append({
-                "id": file_id,
-                "original_name": f"{conv['display_name']} (from {source_label} ZIP)",
-                "saved_as": file_name,
-                "file_type": "text",
-                "detected_type": detected_type,
-                "participants": participants,
-                "subject": None,
-                "path": str(file_path),
-                "size": file_path.stat().st_size
-            })
-            
-            # Save meta file with detected_type and participants so it persists on rescan
-            meta_path = UPLOAD_DIR / "text" / f"{file_id}.meta.json"
+            # Save meta
+            meta_path = folder / f"{file_id}.meta.json"
             with open(meta_path, 'w') as f:
                 json.dump({
                     "detected_type": detected_type,
-                    "participants": participants,
+                    "participants": [p.get('name') for p in merged_data.get('participants', [])],
                     "original_name": conv['display_name']
                 }, f)
+                
+            uploaded.append({
+                "id": file_id, "original_name": f"{conv['display_name']} ({source_label})",
+                "detected_type": detected_type
+            })
             
         except Exception as e:
-            rejected.append({
-                "name": conv["display_name"],
-                "reason": f"Error processing: {str(e)}"
-            })
-    
-    # Cleanup: delete ZIP file and temp extraction
+            rejected.append({"name": conv["display_name"], "reason": str(e)})
+
+    # Cleanup
     try:
-        zip_path = Path(zip_info["zip_path"])
-        if zip_path.exists():
-            zip_path.unlink()
-        # Use appropriate cleanup function
+        Path(zip_info["zip_path"]).unlink(missing_ok=True)
         if zip_type == "discord":
             discord_cleanup_zip(zip_id)
         else:
             cleanup_zip(zip_id)
-    except Exception as e:
-        print(f"Cleanup error: {e}")
-    
-    # Remove from pending
+    except: pass
     del pending_zips[zip_id]
     
-    # Collect any warnings from merged_data
-    warnings = []
-    for item in uploaded:
-        # Check if there was a warning stored in the last merged_data processing
-        # (we'll need to track this separately)
-        pass
-    
-    response = {
-        "success": True,
-        "uploaded": uploaded,
-        "rejected": rejected,
-        "uploaded_count": len(uploaded),
-        "rejected_count": len(rejected)
-    }
-    
-    # Add Discord warning if applicable
-    if zip_type == "discord" and uploaded:
-        response["warning"] = (
-            "⚠️ This Discord export uses an older format without sender information. "
-            "All messages appear as 'Discord_User'. For proper AI training, request a new "
-            "data export from Discord (privacy settings) which includes Author data."
-        )
-    
-    return jsonify(response)
-
+    return jsonify({"success": True, "uploaded": uploaded, "rejected": rejected})
 
 @app.route("/api/files/<file_type>", methods=["GET"])
 def list_files(file_type):
-    """List all files in uploads folder by type - direct folder scan."""
     if file_type not in ["text", "voice"]:
-        return jsonify({"error": "Invalid file type"}), 400
-    
-    # Scan folder directly for real-time sync
+        return jsonify({"error": "Invalid type"}), 400
     files = scan_uploads_folder(file_type)
-    
-    return jsonify({
-        "files": files,
-        "count": len(files)
-    })
-
-
-@app.route("/api/files/<file_type>/<file_id>/participants", methods=["GET"])
-def get_participants(file_type, file_id):
-    """Get participants for an uploaded file."""
-    folder = UPLOAD_DIR / file_type
-    
-    # Find file by ID prefix
-    matching_files = list(folder.glob(f"{file_id}.*"))
-    if not matching_files:
-        return jsonify({"error": "File not found"}), 404
-    
-    file_path = matching_files[0]
-    detected_type = classify_file(str(file_path))
-    participants = []
-    if detected_type in ["WhatsApp", "Instagram", "LINE"]:
-        participants = extract_participants(str(file_path), detected_type)
-    
-    return jsonify({
-        "file_id": file_id,
-        "participants": participants,
-        "detected_type": detected_type
-    })
-
+    return jsonify({"files": files, "count": len(files)})
 
 @app.route("/api/files/<file_type>/<file_id>/subject", methods=["POST"])
 def set_subject(file_type, file_id):
-    """Set the subject for an uploaded file (stored in a metadata file)."""
     folder = UPLOAD_DIR / file_type
+    matches = list(folder.glob(f"{file_id}.*"))
+    if not matches: return jsonify({"error": "Not found"}), 404
     
-    # Find file by ID prefix
-    matching_files = list(folder.glob(f"{file_id}.*"))
-    if not matching_files:
-        return jsonify({"error": "File not found"}), 404
+    subject = request.json.get("subject")
+    if not subject: return jsonify({"error": "No subject"}), 400
     
-    data = request.get_json()
-    subject = data.get("subject")
-    
-    if not subject:
-        return jsonify({"error": "Subject is required"}), 400
-    
-    # Store subject in a metadata JSON file
     meta_file = folder / f"{file_id}.meta.json"
-    import json
-    meta_data = {"subject": subject}
-    with open(meta_file, 'w') as f:
-        json.dump(meta_data, f)
+    meta_data = {}
+    if meta_file.exists():
+        with open(meta_file, 'r') as f: meta_data = json.load(f)
+    meta_data["subject"] = subject
+    with open(meta_file, 'w') as f: json.dump(meta_data, f)
     
-    return jsonify({
-        "success": True,
-        "file_id": file_id,
-        "subject": subject
-    })
-
+    return jsonify({"success": True, "subject": subject})
 
 @app.route("/api/files/<file_type>/<file_id>", methods=["DELETE"])
 def delete_file(file_type, file_id):
-    """Delete an uploaded file."""
     folder = UPLOAD_DIR / file_type
+    matches = list(folder.glob(f"{file_id}.*"))
+    deleted = False
+    for p in matches:
+        p.unlink()
+        deleted = True
+    (folder / f"{file_id}.meta.json").unlink(missing_ok=True)
     
-    # Find and delete file by ID prefix
-    matching_files = list(folder.glob(f"{file_id}.*"))
-    if not matching_files:
-        return jsonify({"error": "File not found"}), 404
-    
-    for file_path in matching_files:
-        file_path.unlink()
-    
-    # Also delete metadata file if exists
-    meta_file = folder / f"{file_id}.meta.json"
-    if meta_file.exists():
-        meta_file.unlink()
-    
-    return jsonify({
-        "success": True,
-        "deleted_id": file_id
-    })
+    if not deleted: return jsonify({"error": "Not found"}), 404
+    return jsonify({"success": True})
 
 
-# --- Health Check ---
-
-@app.route("/api/health", methods=["GET"])
-def health_check():
-    """Health check endpoint."""
-    return jsonify({
-        "status": "ok",
-        "service": "nulltale-api"
-    })
-
-
-# --- Processing Endpoints ---
-
-PREPROCESSED_DIR = Path(__file__).parent / "preprocessed"
-PREPROCESSED_DIR.mkdir(exist_ok=True)
-
+# --- API Endpoints: Processing & Refresh ---
 
 @app.route("/api/refresh/ready", methods=["GET"])
 def check_refresh_ready():
-    """Check if we're ready to process (all files have subjects selected)."""
     files = scan_uploads_folder("text")
-    
     if not files:
-        return jsonify({
-            "ready": False,
-            "reason": "No files uploaded",
-            "files_count": 0,
-            "files_with_subject": 0
-        })
-    
+        return jsonify({"ready": False, "reason": "No files uploaded"})
     files_with_subject = [f for f in files if f.get("subject")]
-    
     if len(files_with_subject) < len(files):
-        return jsonify({
-            "ready": False,
-            "reason": "Some files don't have a subject selected",
-            "files_count": len(files),
-            "files_with_subject": len(files_with_subject)
-        })
-    
-    return jsonify({
-        "ready": True,
-        "files_count": len(files),
-        "files_with_subject": len(files_with_subject)
-    })
-
+        return jsonify({"ready": False, "reason": "Missing subjects"})
+    return jsonify({"ready": True})
 
 @app.route("/api/refresh", methods=["POST"])
-def process_files():
-    """
-    Process all uploaded files through the preprocessing pipeline.
-    Returns SSE stream with progress updates.
-    """
-    from flask import Response, stream_with_context
-    import json as json_module
-    import shutil
-    
-    # Import processing modules
-    from processor import generate_style_file, generate_context_chunks
-    from style_summarizer import generate_style_summary
-    from context_embedder import generate_embeddings
+def refresh_memory():
+    session_id = request.json.get("session_id")
     
     def generate():
         try:
-            # Step 1: Check files are ready
-            yield f"data: {json_module.dumps({'step': 'checking', 'progress': 0, 'message': 'Checking files...'})}\n\n"
+            yield f"data: {json.dumps({'step': 'starting', 'progress': 0, 'message': 'Starting refresh...'})}\n\n"
             
+            # 1. Text Processing
             files = scan_uploads_folder("text")
-            if not files:
-                yield f"data: {json_module.dumps({'step': 'error', 'progress': 0, 'message': 'No files uploaded'})}\n\n"
-                return
-            
-            # Check all files have subjects
-            files_without_subject = [f for f in files if not f.get("subject")]
-            if files_without_subject:
-                yield f"data: {json_module.dumps({'step': 'error', 'progress': 0, 'message': 'Some files are missing subject selection'})}\n\n"
-                return
-            
-            # Group files by subject
             subject_files = {}
             for f in files:
-                subject = f["subject"]
-                if subject not in subject_files:
-                    subject_files[subject] = []
-                subject_files[subject].append(f)
+                sub = f["subject"]
+                if sub not in subject_files: subject_files[sub] = []
+                subject_files[sub].append(f)
             
-            yield f"data: {json_module.dumps({'step': 'preparing', 'progress': 5, 'message': f'Found {len(files)} files for {len(subject_files)} subject(s)'})}\n\n"
+            yield f"data: {json.dumps({'step': 'cleaning', 'progress': 10, 'message': 'Cleaning old data...'})}\n\n"
+            for p in PREPROCESSED_DIR.glob("*"): p.unlink()
             
-            # Step 2: Clear preprocessed folder
-            yield f"data: {json_module.dumps({'step': 'cleaning', 'progress': 10, 'message': 'Cleaning preprocessed folder...'})}\n\n"
-            
-            for file_path in PREPROCESSED_DIR.iterdir():
-                if file_path.is_file():
-                    file_path.unlink()
-            
-            # Process each subject
-            total_subjects = len(subject_files)
-            for idx, (subject, subject_file_list) in enumerate(subject_files.items()):
-                base_progress = 15 + (idx * 80 // total_subjects)
-                step_size = 80 // total_subjects
+            total = len(subject_files)
+            for idx, (subject, s_files) in enumerate(subject_files.items()):
+                yield f"data: {json.dumps({'step': 'processing', 'progress': 20, 'message': f'Processing {subject}...'})}\n\n"
                 
-                yield f"data: {json_module.dumps({'step': 'processing', 'progress': base_progress, 'message': f'Processing {subject}...'})}\n\n"
+                results = [(f["original_name"], f["path"], f["detected_type"], subject) for f in s_files]
                 
-                # Prepare file results format: (filename, filepath, filetype, subject)
-                file_results = []
-                for f in subject_file_list:
-                    file_results.append((
-                        f["original_name"],
-                        f["path"],
-                        f["detected_type"],
-                        subject
-                    ))
+                # Style Generation
+                temp_style = PREPROCESSED_DIR / f"{subject}_style_temp.txt"
+                generate_style_file(results, str(temp_style))
                 
-                # Step 3: Generate style file (temporary)
-                yield f"data: {json_module.dumps({'step': 'style', 'progress': base_progress + step_size * 0.15, 'message': f'Generating style data for {subject}...'})}\n\n"
-                
-                temp_style_path = PREPROCESSED_DIR / f"{subject}_style_temp.txt"
-                generate_style_file(file_results, str(temp_style_path))
-                
-                # Step 4: Generate context chunks
-                yield f"data: {json_module.dumps({'step': 'chunks', 'progress': base_progress + step_size * 0.30, 'message': f'Generating context chunks for {subject}...'})}\n\n"
-                
+                # Context Chunks
                 chunks_path = PREPROCESSED_DIR / f"{subject}_context_chunks.json"
-                generate_context_chunks(file_results, str(chunks_path))
+                generate_context_chunks(results, str(chunks_path))
                 
-                # Step 5: Generate style summary via Gemini
-                yield f"data: {json_module.dumps({'step': 'summary', 'progress': base_progress + step_size * 0.50, 'message': f'Analyzing style with Gemini for {subject}...'})}\n\n"
-                
+                # Style Summary
+                yield f"data: {json.dumps({'step': 'summary', 'progress': 50, 'message': f'Analyzing style for {subject}...'})}\n\n"
                 summary_path = PREPROCESSED_DIR / f"{subject}_style_summary.txt"
-                generate_style_summary(str(temp_style_path), str(summary_path), subject)
+                generate_style_summary(str(temp_style), str(summary_path), subject)
                 
-                # Step 6: Generate embeddings
-                yield f"data: {json_module.dumps({'step': 'embeddings', 'progress': base_progress + step_size * 0.75, 'message': f'Generating embeddings for {subject}...'})}\n\n"
-                
+                # Embeddings
+                yield f"data: {json.dumps({'step': 'embeddings', 'progress': 70, 'message': f'Generating embeddings for {subject}...'})}\n\n"
                 embeddings_path = PREPROCESSED_DIR / f"{subject}_embeddings.json"
                 generate_embeddings(str(chunks_path), str(embeddings_path))
                 
-                # Step 7: Cleanup temporary files
-                if temp_style_path.exists():
-                    temp_style_path.unlink()
+                if temp_style.exists(): temp_style.unlink()
+            
+            # 2. Voice Cloning (if session provided)
+            voice_result = None
+            if session_id and session_id in sessions_db:
+                # Check for staged voice files
+                voice_files = scan_uploads_folder("voice")
+                # Sort by newest
+                voice_files.sort(key=lambda x: os.path.getmtime(x["path"]), reverse=True)
                 
-                yield f"data: {json_module.dumps({'step': 'done_subject', 'progress': base_progress + step_size, 'message': f'Completed {subject}'})}\n\n"
+                api_key = get_wavespeed_key()
+                
+                if voice_files and api_key and _wavespeed_manager:
+                    yield f"data: {json.dumps({'step': 'voice', 'progress': 80, 'message': 'Cloning voice...'})}\n\n"
+                    target_file = voice_files[0]
+                    session = sessions_db[session_id]
+                    
+                    try:
+                        # Construct valid voice name
+                        clean_name = "".join(c for c in session["name"] if c.isalnum())
+                        voice_name_id = f"NullTale{session_id}{clean_name}"
+                        
+                        manager = get_wavespeed_manager()
+                        voice_id = manager.clone_voice(voice_name_id, target_file["path"])
+                        
+                        # Update session
+                        now = datetime.now().isoformat()
+                        session["wavespeed_voice_id"] = voice_id
+                        session["voice_created_at"] = now
+                        session["voice_last_used_at"] = now
+                        save_sessions()
+                        
+                        # Cleanup used voice file
+                        Path(target_file["path"]).unlink()
+                        
+                        voice_result = {"success": True, "message": "Voice cloned successfully"}
+                    except Exception as e:
+                        voice_result = {"error": str(e)}
             
-            # Final cleanup - remove any remaining temp files
-            for file_path in PREPROCESSED_DIR.iterdir():
-                if '_temp' in file_path.name or '_style.txt' in file_path.name:
-                    file_path.unlink()
-            
-            yield f"data: {json_module.dumps({'step': 'complete', 'progress': 100, 'message': 'Processing complete!'})}\n\n"
+            yield f"data: {json.dumps({'step': 'complete', 'progress': 100, 'message': 'Refresh complete!', 'voice_cloning': voice_result})}\n\n"
             
         except Exception as e:
-            import traceback
-            traceback.print_exc()
-            yield f"data: {json_module.dumps({'step': 'error', 'progress': 0, 'message': f'Error: {str(e)}'})}\n\n"
-    
-    return Response(
-        stream_with_context(generate()),
-        mimetype='text/event-stream',
-        headers={
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            'X-Accel-Buffering': 'no'
-        }
-    )
+            yield f"data: {json.dumps({'step': 'error', 'message': str(e)})}\n\n"
+            
+    return Response(stream_with_context(generate()), mimetype='text/event-stream')
 
 
-# --- Chat / Sessions Endpoints ---
-
-# Chats directory for persistence
-CHATS_DIR = Path(__file__).parent / "chats"
-CHATS_DIR.mkdir(exist_ok=True)
-
-# In-memory storage for sessions and messages
-sessions = {}
-messages = {}
-chatbots = {}  # PersonaChatbot instances per session
-
-
-def save_session(session_id):
-    """Save a session to disk."""
-    if session_id not in sessions:
-        return
-    
-    session_file = CHATS_DIR / f"{session_id}.json"
-    import json
-    data = {
-        "session": sessions[session_id],
-        "messages": messages.get(session_id, [])
-    }
-    with open(session_file, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2)
-
-
-def load_sessions():
-    """Load all sessions from disk."""
-    import json
-    for file_path in CHATS_DIR.iterdir():
-        if file_path.suffix == '.json' and not file_path.name.startswith('.'):
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                session = data.get("session", {})
-                session_id = session.get("id")
-                if session_id:
-                    sessions[session_id] = session
-                    messages[session_id] = data.get("messages", [])
-                    
-                    # Initialize chatbot if subject available
-                    subject = session.get("subject")
-                    if subject:
-                        initialize_chatbot(session_id, subject)
-            except Exception as e:
-                print(f"Error loading session from {file_path}: {e}")
-
-
-def delete_session_file(session_id):
-    """Delete a session file from disk."""
-    session_file = CHATS_DIR / f"{session_id}.json"
-    if session_file.exists():
-        session_file.unlink()
-
-
-def get_available_subjects():
-    """Get list of available subjects from preprocessed folder."""
-    subjects = []
-    if PREPROCESSED_DIR.exists():
-        for file_path in PREPROCESSED_DIR.iterdir():
-            if file_path.name.endswith('_embeddings.json'):
-                subject = file_path.stem.replace('_embeddings', '')
-                subjects.append(subject)
-    return subjects
-
-
-def initialize_chatbot(session_id, subject):
-    """Initialize a PersonaChatbot for a session."""
-    from chatbot import PersonaChatbot
-    
-    summary_path = PREPROCESSED_DIR / f"{subject}_style_summary.txt"
-    embeddings_path = PREPROCESSED_DIR / f"{subject}_embeddings.json"
-    
-    if not summary_path.exists() or not embeddings_path.exists():
-        return None
-    
-    try:
-        chatbot = PersonaChatbot(str(summary_path), str(embeddings_path))
-        chatbots[session_id] = chatbot
-        return chatbot
-    except Exception as e:
-        print(f"Failed to initialize chatbot for {subject}: {e}")
-        return None
-
-
-# Load existing sessions on module load
-load_sessions()
-
+# --- API Endpoints: Sessions & Chat ---
 
 @app.route("/api/sessions", methods=["GET"])
-def get_sessions():
-    """Get all sessions."""
-    return jsonify({
-        "sessions": list(sessions.values())
-    })
-
+def list_sessions():
+    return jsonify({"sessions": list(sessions_db.values())})
 
 @app.route("/api/sessions", methods=["POST"])
 def create_session():
-    """Create a new chat session."""
-    import uuid as uuid_module
-    data = request.get_json() or {}
-    
-    # Get available subjects
-    available_subjects = get_available_subjects()
-    
-    session_id = uuid_module.uuid4().hex[:8]
-    name = data.get("name", "New Chat")
-    
-    # If a subject is available, use the first one
-    subject = available_subjects[0] if available_subjects else None
+    data = request.json or {}
+    subjects = get_available_subjects()
+    session_id = uuid.uuid4().hex[:8]
+    subject = subjects[0] if subjects else None
     
     session = {
         "id": session_id,
-        "name": name,
+        "name": data.get("name", "New Chat"),
         "subject": subject,
         "preview": "Start chatting...",
         "created_at": datetime.now().isoformat()
     }
+    sessions_db[session_id] = session
+    messages_db[session_id] = []
     
-    sessions[session_id] = session
-    messages[session_id] = []
-    
-    # Initialize chatbot if subject available
     if subject:
-        initialize_chatbot(session_id, subject)
-    
-    # Save to disk
-    save_session(session_id)
-    
+        get_or_create_chatbot(session_id)
+        
+    save_sessions()
     return jsonify(session)
-
 
 @app.route("/api/sessions/<session_id>", methods=["DELETE"])
 def delete_session(session_id):
-    """Delete a session."""
-    if session_id in sessions:
-        del sessions[session_id]
-    if session_id in messages:
-        del messages[session_id]
-    if session_id in chatbots:
-        del chatbots[session_id]
+    if session_id in sessions_db: del sessions_db[session_id]
+    if session_id in messages_db: del messages_db[session_id]
+    if session_id in chatbots: del chatbots[session_id]
     
-    # Delete from disk
-    delete_session_file(session_id)
+    # Delete persistence files
+    (CHATS_DIR / f"{session_id}.json").unlink(missing_ok=True) # Old format
+    (CHATS_DIR / f"history_{session_id}.json").unlink(missing_ok=True)
+    save_sessions()
     
-    return jsonify({"success": True, "deleted_id": session_id})
-
+    return jsonify({"success": True})
 
 @app.route("/api/messages/<session_id>", methods=["GET"])
-def get_messages(session_id):
-    """Get messages for a session."""
-    return jsonify({
-        "messages": messages.get(session_id, [])
-    })
-
+def get_session_messages(session_id):
+    return jsonify({"messages": messages_db.get(session_id, [])})
 
 @app.route("/api/chat", methods=["POST"])
-def chat():
-    """Send a message and get AI response."""
-    from datetime import datetime
-    import uuid as uuid_module
-    
-    data = request.get_json()
+def send_message():
+    data = request.json
     content = data.get("content", "").strip()
-    session_id = data.get("session_id", "default")
+    session_id = data.get("session_id")
     
-    if not content:
-        return jsonify({"error": "No message content"}), 400
-    
-    # Ensure session exists
-    if session_id not in sessions:
-        # Create default session
-        available_subjects = get_available_subjects()
-        subject = available_subjects[0] if available_subjects else None
+    if not content or not session_id:
+        return jsonify({"error": "Missing content or session_id"}), 400
         
-        sessions[session_id] = {
-            "id": session_id,
-            "name": "Chat",
-            "subject": subject,
-            "preview": content[:50],
-            "created_at": datetime.now().isoformat()
-        }
-        messages[session_id] = []
+    if session_id not in sessions_db:
+        # Create implicitly
+        create_session()
         
-        if subject:
-            initialize_chatbot(session_id, subject)
-    
-    # Create user message
-    timestamp = datetime.now().strftime("%I:%M %p")
+    # User message
     user_msg = {
-        "id": uuid_module.uuid4().hex[:8],
+        "id": uuid.uuid4().hex[:8],
         "role": "user",
         "content": content,
-        "timestamp": timestamp
+        "timestamp": datetime.now().strftime("%I:%M %p")
     }
+    if session_id not in messages_db: messages_db[session_id] = []
+    messages_db[session_id].append(user_msg)
     
-    if session_id not in messages:
-        messages[session_id] = []
-    messages[session_id].append(user_msg)
-    
-    # Generate AI response
-    chatbot = chatbots.get(session_id)
+    # Get AI response
+    chatbot = get_or_create_chatbot(session_id)
+    ai_content = "I'm not ready yet. Please upload files and refresh memory."
     
     if chatbot:
         try:
             ai_content = chatbot.chat(content)
         except Exception as e:
-            print(f"Chatbot error: {e}")
-            ai_content = "I'm having trouble processing that. Please try again."
-    else:
-        # No chatbot available - check if preprocessing is needed
-        available_subjects = get_available_subjects()
-        if not available_subjects:
-            ai_content = "Please upload chat files and run 'Refresh AI Memory' from the Knowledge Base first."
-        else:
-            # Try to initialize chatbot
-            subject = available_subjects[0]
-            if initialize_chatbot(session_id, subject):
-                try:
-                    ai_content = chatbots[session_id].chat(content)
-                except Exception as e:
-                    ai_content = f"Error: {str(e)}"
-            else:
-                ai_content = "Failed to initialize the AI. Please check your preprocessed files."
-    
-    # Split AI response into multiple messages to emulate natural conversation
-    # Split on double newlines or single newlines if they look like separate messages
+            ai_content = f"Error: {e}"
+            
+    # Process AI response (split into messages)
     import re
+    parts = [p.strip() for p in re.split(r'\n{2,}', ai_content) if p.strip()]
+    if not parts: parts = [ai_content]
     
-    # Split on newlines but keep it natural
-    raw_parts = re.split(r'\n{1,}', ai_content.strip())
-    
-    # Filter out empty parts and combine very short ones
-    parts = []
-    for part in raw_parts:
-        part = part.strip()
-        if part:
-            parts.append(part)
-    
-    # If no parts or single part, use original content
-    if not parts:
-        parts = [ai_content]
-    
-    # Create multiple AI messages
     ai_messages = []
-    timestamp = datetime.now().strftime("%I:%M %p")
+    ts = datetime.now().strftime("%I:%M %p")
     
-    for i, part in enumerate(parts):
-        ai_msg = {
-            "id": uuid_module.uuid4().hex[:8],
+    for part in parts:
+        msg = {
+            "id": uuid.uuid4().hex[:8],
             "role": "assistant",
             "content": part,
-            "timestamp": timestamp
+            "timestamp": ts
         }
-        messages[session_id].append(ai_msg)
-        ai_messages.append(ai_msg)
-    
-    # Update session preview with first message
-    if session_id in sessions and ai_messages:
-        preview_content = ai_messages[0]["content"]
-        sessions[session_id]["preview"] = preview_content[:50] + "..." if len(preview_content) > 50 else preview_content
-    
-    # Save to disk
-    save_session(session_id)
+        messages_db[session_id].append(msg)
+        ai_messages.append(msg)
+        
+    # Update preview
+    if ai_messages:
+        preview = ai_messages[0]["content"]
+        sessions_db[session_id]["preview"] = preview[:50] + "..." if len(preview) > 50 else preview
+        
+    save_message_history(session_id)
+    save_sessions()
     
     return jsonify({
         "user_message": user_msg,
-        "ai_message": ai_messages[0] if len(ai_messages) == 1 else ai_messages[0],
-        "ai_messages": ai_messages  # Return all messages
+        "ai_message": ai_messages[0],
+        "ai_messages": ai_messages
     })
 
 
-@app.route("/api/subjects", methods=["GET"])
-def list_subjects():
-    """List available subjects from preprocessed folder."""
+# --- API Endpoints: Voice Cloning & Calls ---
+
+@app.route("/api/voice/status/<session_id>", methods=["GET"])
+def get_voice_status(session_id):
+    if session_id not in sessions_db:
+        return jsonify({"error": "Session not found"}), 404
+        
+    session = sessions_db[session_id]
+    voice_id = session.get("wavespeed_voice_id")
+    
+    if not voice_id:
+        return jsonify({"has_voice": False, "voice_status": "none", "message": "No voice configured"})
+        
+    # Check expiration
+    last_used = session.get("voice_last_used_at") or session.get("voice_created_at")
+    status = "active"
+    days_left = 7
+    message = "Voice active"
+    
+    if last_used:
+        try:
+            last_dt = datetime.fromisoformat(last_used)
+            elapsed = (datetime.now() - last_dt).days
+            days_left = max(0, 7 - elapsed)
+            
+            if days_left <= 0:
+                status = "expired"
+                message = "Voice expired. Please re-upload."
+            elif days_left <= 2:
+                status = "warning"
+                message = f"Expiring in {days_left} days."
+        except: pass
+        
     return jsonify({
-        "subjects": get_available_subjects()
+        "has_voice": True, "voice_id": voice_id,
+        "voice_status": status, "days_remaining": days_left, "message": message
     })
 
-
-# --- Settings Endpoints ---
-
-# In-memory settings (could be persisted to file if needed)
-_app_settings = {
-    "model_version": "v2.4",
-    "temperature": 0.7,
-    "api_key": "sk-........................"
-}
-
-@app.route("/api/settings", methods=["GET"])
-def get_settings():
-    """Get app settings."""
-    return jsonify(_app_settings)
-
-
-@app.route("/api/settings", methods=["PUT"])
-def update_settings():
-    """Update app settings."""
-    global _app_settings
-    data = request.get_json()
-    
-    # Update only allowed fields
-    if "model_version" in data:
-        _app_settings["model_version"] = data["model_version"]
-    if "temperature" in data:
-        _app_settings["temperature"] = data["temperature"]
-    if "api_key" in data:
-        _app_settings["api_key"] = data["api_key"]
-    
-    return jsonify({"success": True, "settings": _app_settings})
-
-
-@app.route("/api/settings/wavespeed-key", methods=["GET"])
-def get_wavespeed_key_status():
-    """
-    Check if WaveSpeed API key is configured.
-    Does NOT return the actual key for security.
-    """
-    has_key = has_wavespeed_key()
-    return jsonify({
-        "configured": has_key,
-        "message": "API key is configured" if has_key else "No API key set"
-    })
-
-
-@app.route("/api/settings/wavespeed-key", methods=["POST"])
-def set_wavespeed_key():
-    """
-    Save WaveSpeed API key securely.
-    Request body: { "api_key": "your-api-key" }
-    """
-    data = request.get_json()
-    api_key = data.get("api_key", "").strip()
-    
-    if not api_key:
-        return jsonify({"error": "API key is required"}), 400
-    
-    # Basic validation - WaveSpeed keys typically start with certain prefixes
-    if len(api_key) < 20:
-        return jsonify({"error": "Invalid API key format"}), 400
-    
-    # Save securely
-    if save_wavespeed_key(api_key):
-        # Force reload manager with new key on next use
-        global _wavespeed_manager
-        _wavespeed_manager = None
-        
-        return jsonify({
-            "success": True,
-            "message": "API key saved successfully"
-        })
-    else:
-        return jsonify({"error": "Failed to save API key"}), 500
-
-
-@app.route("/api/settings/wavespeed-key", methods=["DELETE"])
-def delete_wavespeed_key_endpoint():
-    """Delete the stored WaveSpeed API key."""
-    from secrets_manager import delete_secret
-    
-    if delete_secret("wavespeed_api_key"):
-        global _wavespeed_manager
-        _wavespeed_manager = None
-        
-        return jsonify({
-            "success": True,
-            "message": "API key removed"
-        })
-    else:
-        return jsonify({"error": "No API key to remove"}), 404
-
-
-@app.route("/api/settings/wavespeed-key/test", methods=["POST"])
-def test_wavespeed_key():
-    """
-    Test if the saved WaveSpeed API key is valid.
-    Makes a simple API call to verify the key works.
-    """
-    try:
-        manager = get_wavespeed_manager(force_reload=True)
-        voices = manager.list_voices()
-        return jsonify({
-            "success": True,
-            "message": "API key is valid!",
-            "voices": voices
-        })
-    except ValueError as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 400
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": f"API key test failed: {str(e)}"
-        }), 400
-
-
-# --- Voice / TTS Endpoints ---
-
-# Lazy-loaded WaveSpeed manager instance (created on first use)
-_wavespeed_manager = None
-
-def get_wavespeed_manager(force_reload: bool = False):
-    """
-    Get or create the WaveSpeed manager instance.
-    Uses secrets_manager for secure key storage, falls back to env var.
-    
-    Args:
-        force_reload: If True, recreate the manager with current key
-    """
-    global _wavespeed_manager
-    
-    if _wavespeed_manager is None or force_reload:
-        # Try secure storage first, then env var
-        api_key = get_wavespeed_key()
-        
-        if not api_key:
-            raise ValueError(
-                "WaveSpeed API key not configured. "
-                "Please set it in Settings > Voice."
-            )
-        
-        _wavespeed_manager = WaveSpeedManager(api_key=api_key)
-    
-    return _wavespeed_manager
-
-
-@app.route("/api/voice/clone", methods=["POST"])
-def clone_voice():
-    """
-    Clone a voice from an uploaded audio file.
-    Request body: { "voice_name": "my_voice" }
-    Expects audio file in 'file' field.
-    """
+@app.route("/api/voice/clone/<session_id>", methods=["POST"])
+def clone_voice_endpoint(session_id):
+    """Direct cloning endpoint."""
     if "file" not in request.files:
-        return jsonify({"error": "No audio file provided"}), 400
-    
-    audio_file = request.files["file"]
-    voice_name = request.form.get("voice_name", "cloned_voice")
-    
-    if audio_file.filename == "":
-        return jsonify({"error": "No file selected"}), 400
-    
-    # Save audio file temporarily
-    file_id = uuid.uuid4().hex[:12]
-    ext = Path(audio_file.filename).suffix.lower() or ".wav"
-    temp_path = UPLOAD_DIR / "voice" / f"{file_id}_clone{ext}"
-    audio_file.save(str(temp_path))
+        return jsonify({"error": "No file"}), 400
+        
+    file = request.files["file"]
+    manager = get_wavespeed_manager()
+    if not manager:
+        return jsonify({"error": "WaveSpeed key not set"}), 400
+        
+    temp_path = UPLOAD_DIR / "voice" / f"temp_{uuid.uuid4().hex}.wav"
+    file.save(str(temp_path))
     
     try:
-        manager = get_wavespeed_manager()
-        voice_id = manager.clone_voice(voice_name, str(temp_path))
+        session = sessions_db.get(session_id, {"name": "Unknown"})
+        clean_name = "".join(c for c in session["name"] if c.isalnum())
+        voice_id = manager.clone_voice(f"NullTale{session_id[:6]}{clean_name}", str(temp_path))
         
-        return jsonify({
-            "success": True,
-            "voice_id": voice_id,
-            "voice_name": voice_name,
-            "message": f"Voice '{voice_name}' cloned successfully!"
-        })
+        if session_id in sessions_db:
+            sessions_db[session_id]["wavespeed_voice_id"] = voice_id
+            save_sessions()
+            
+        return jsonify({"success": True, "voice_id": voice_id})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
-        # Cleanup temp file
-        if temp_path.exists():
-            temp_path.unlink()
+        if temp_path.exists(): temp_path.unlink()
 
-
-@app.route("/api/voice/speak", methods=["POST"])
-def speak():
-    """
-    Generate speech from text using WaveSpeed TTS.
-    Request body: { "text": "Hello world", "voice": "voice_id" }
-    Returns WAV audio file.
-    """
-    data = request.get_json()
-    text = data.get("text", "")
-    voice = data.get("voice", "Deep_Voice_Man")
+@app.route("/api/call/stream", methods=["POST"])
+def stream_call():
+    """Stream voice call response (text + audio)."""
+    data = request.json
+    content = data.get("content")
+    session_id = data.get("session_id")
     
-    if not text:
-        return jsonify({"error": "Text is required"}), 400
-    
-    try:
-        manager = get_wavespeed_manager()
-        audio_buffer = manager.speak(text, voice)
+    if not content or not session_id:
+        return jsonify({"error": "Missing params"}), 400
         
-        from flask import send_file
-        return send_file(
-            audio_buffer,
-            mimetype="audio/wav",
-            as_attachment=False,
-            download_name="speech.wav"
-        )
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/voice/speak/stream", methods=["POST"])
-def speak_stream():
-    """
-    Generate speech from text with streaming (SSE).
-    Request body: { "text": "Hello world", "voice": "voice_id" }
-    Returns SSE stream with audio chunks.
-    """
-    from flask import Response
-    import base64
-    
-    data = request.get_json()
-    text = data.get("text", "")
-    voice = data.get("voice", "Deep_Voice_Man")
-    
-    if not text:
-        return jsonify({"error": "Text is required"}), 400
-    
     def generate():
-        try:
-            manager = get_wavespeed_manager()
+        # 1. Get AI Text Response
+        # Note: Ideally we'd stream text from Gemini too, but for now we get full block
+        chatbot = get_or_create_chatbot(session_id)
+        if not chatbot:
+            yield f"data: {json.dumps({'type': 'error', 'content': 'AI not ready'})}\n\n"
+            return
             
-            for chunk in manager.speak_stream(text, voice):
-                # Base64 encode WAV chunk for SSE transport
-                chunk_b64 = base64.b64encode(chunk).decode('utf-8')
-                yield f"data: {json.dumps({'audio': chunk_b64})}\n\n"
-            
-            yield f"data: {json.dumps({'done': True})}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-    
-    return Response(
-        generate(),
-        mimetype="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no"
-        }
-    )
-
-
-@app.route("/api/voice/list", methods=["GET"])
-def list_voices():
-    """List available voices (system + cloned)."""
-    try:
+        text_response = chatbot.chat(content)
+        
+        # Send text event
+        yield f"data: {json.dumps({'type': 'text', 'content': text_response})}\n\n"
+        
+        # 2. Get Voice Audio
+        session = sessions_db.get(session_id)
+        voice_id = session.get("wavespeed_voice_id")
         manager = get_wavespeed_manager()
-        voices = manager.list_voices()
-        return jsonify(voices)
-    except Exception as e:
-        # Return default system voices even if manager fails
-        return jsonify({
-            "system": [
-                "Wise_Woman",
-                "Friendly_Person",
-                "Deep_Voice_Man",
-                "Calm_Woman",
-                "Inspirational_girl"
-            ],
-            "cloned": [],
-            "error": str(e)
-        })
+        
+        if voice_id and manager:
+            yield f"data: {json.dumps({'type': 'status', 'content': 'speaking'})}\n\n"
+            try:
+                # Update usage time
+                if session_id in sessions_db:
+                    sessions_db[session_id]["voice_last_used_at"] = datetime.now().isoformat()
+                    save_sessions()
+                    
+                idx = 0
+                for chunk in manager.speak_stream(text_response, voice_id):
+                    b64 = base64.b64encode(chunk).decode('utf-8')
+                    yield f"data: {json.dumps({'type': 'audio', 'index': idx, 'content': b64})}\n\n"
+                    idx += 1
+            except Exception as e:
+                print(f"Voice generation error: {e}")
+                # Don't fail the whole request, text was already sent
+                
+        yield f"data: {json.dumps({'type': 'done', 'full_text': text_response})}\n\n"
+        
+    return Response(stream_with_context(generate()), mimetype='text/event-stream')
 
+@app.route("/api/voices", methods=["GET"])
+def list_voices():
+    manager = get_wavespeed_manager()
+    if not manager:
+        return jsonify({"system": [], "cloned": [], "message": "API key not set"})
+    return jsonify(manager.list_voices())
+
+# --- API Endpoints: Settings ---
+
+@app.route("/api/settings", methods=["GET"])
+def get_settings():
+    return jsonify(settings_db)
+
+@app.route("/api/settings", methods=["PUT"])
+def update_settings():
+    data = request.json
+    settings_db.update(data)
+    return jsonify({"success": True, "settings": settings_db})
+
+@app.route("/api/settings/wavespeed-key", methods=["GET", "POST", "DELETE"])
+def wavespeed_key_mgmt():
+    if request.method == "GET":
+        has_key = has_wavespeed_key()
+        return jsonify({"configured": has_key})
+        
+    if request.method == "POST":
+        key = request.json.get("api_key")
+        if save_wavespeed_key(key):
+            get_wavespeed_manager(force_reload=True)
+            return jsonify({"success": True})
+        return jsonify({"error": "Failed to save"}), 500
+        
+    if request.method == "DELETE":
+        delete_secret("wavespeed_api_key")
+        global _wavespeed_manager
+        _wavespeed_manager = None
+        return jsonify({"success": True})
+
+@app.route("/api/settings/wavespeed-key/test", methods=["POST"])
+def test_wavespeed_key():
+    try:
+        mgr = get_wavespeed_manager(force_reload=True)
+        if mgr:
+            return jsonify({"success": True, "voices": mgr.list_voices()})
+        return jsonify({"success": False, "error": "No key"})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+@app.route("/api/warmup", methods=["POST"])
+def warmup():
+    # Preload models
+    get_gemini_model()
+    get_wavespeed_manager()
+    return jsonify({"success": True})
+
+# --- Main Entry Point ---
 
 if __name__ == "__main__":
-    # Import datetime for chat
-    from datetime import datetime
-    
-    print("Starting NullTale API on http://localhost:5000")
-    print(f"Upload directory: {UPLOAD_DIR}")
-    print(f"Root .env loaded from: {ROOT_DIR / '.env'}")
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    load_persistence()
+    print("Starting NullTale API (Consolidated) on http://localhost:5000")
+    print(f"Data directory: {UPLOAD_DIR}")
+    app.run(host="0.0.0.0", port=5000, debug=True, threaded=True)

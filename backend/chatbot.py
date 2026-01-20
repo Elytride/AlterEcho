@@ -23,7 +23,7 @@ class PersonaChatbot:
     A chatbot that replicates a person's talking style with RAG-based knowledge.
     """
     
-    def __init__(self, style_summary_path, embeddings_path, max_history=10):
+    def __init__(self, style_summary_path, embeddings_path, max_history=10, model=None):
         """
         Initialize the chatbot.
         
@@ -31,6 +31,7 @@ class PersonaChatbot:
             style_summary_path: Path to the style summary txt file
             embeddings_path: Path to the context embeddings JSON file
             max_history: Maximum number of conversation turns to remember
+            model: Optional pre-configured Gemini model instance
         """
         # Load style summary
         with open(style_summary_path, 'r', encoding='utf-8') as f:
@@ -45,7 +46,10 @@ class PersonaChatbot:
         self.max_history = max_history
         
         # Initialize Gemini model
-        self.model = genai.GenerativeModel('gemini-flash-latest')
+        if model:
+            self.model = model
+        else:
+            self.model = genai.GenerativeModel('gemini-flash-latest')
         
         print(f"Chatbot initialized for {self.subject}")
         print(f"  Style summary: {len(self.style_summary):,} characters")
