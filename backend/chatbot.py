@@ -206,6 +206,97 @@ Respond as {self.subject}:"""
         except Exception as e:
             yield f"Error: {e}"
 
+    def _build_voice_system_prompt(self, retrieved_context):
+        """
+        Build a TTS-optimized system prompt for voice calls.
+        This version instructs Gemini to produce speech-friendly output.
+        """
+        return f"""You are roleplaying as {self.subject}. Your goal is to respond like {self.subject} would, matching their personality and tone.
+
+## STYLE GUIDE
+The following is an analysis of {self.subject}'s communication style. Use it to inform your vocal personality:
+
+{self.style_summary}
+
+---
+
+## RELEVANT MEMORIES/CONTEXT
+The following are real conversations {self.subject} has had that may be relevant:
+
+{retrieved_context}
+
+---
+
+## VOICE OUTPUT INSTRUCTIONS
+Your response will be converted to speech using a Text-to-Speech engine. You MUST follow these rules:
+
+1. **NO EMOJIS** - Never use any emoji characters. They cannot be spoken.
+2. **NO TEXT SYMBOLS** - Do not use symbols like "<3", ":)", "xD", "lol", "lmao", etc. If you want to express laughter, use natural phrases like "haha" or describe it.
+3. **NORMALIZE EXTENDED WORDS** - Replace stylized spellings with normal words:
+   - "hiiii" → "hi"
+   - "yesss" → "yes"
+   - "nooo" → "no"
+   - "sooo" → "so"
+4. **SPEAK NATURALLY** - Write as if you are speaking out loud. Use contractions and natural phrasing.
+5. **NEVER break character** - Respond only as {self.subject} would.
+6. **Keep it conversational** - Short, natural sentences work best for speech.
+"""
+
+    def stream_chat_voice(self, user_message, top_k_context=5):
+        """
+        Stream a TTS-optimized response from the chatbot.
+        Uses a voice-specific prompt that produces speech-friendly output.
+        
+        Args:
+            user_message: The user's message
+            top_k_context: Number of context chunks to retrieve
+            
+        Yields:
+            Chunks of the response text (TTS-safe)
+        """
+        try:
+            # Retrieve relevant context
+            retrieved = self.retriever.retrieve(user_message, top_k=top_k_context)
+            context_text = self.retriever.format_context(retrieved, include_exchange=True)
+            
+            # Build the voice-optimized prompt
+            system_prompt = self._build_voice_system_prompt(context_text)
+            history_text = self._format_history()
+            
+            full_prompt = f"""{system_prompt}
+
+## CONVERSATION HISTORY
+{history_text}
+
+## CURRENT MESSAGE
+User: {user_message}
+
+Respond as {self.subject} (remember: no emojis, no text symbols, natural speech):"""
+            
+            # Stream generation
+            response = self.model.generate_content(full_prompt, stream=True)
+            
+            full_response = ""
+            for chunk in response:
+                if chunk.text:
+                    full_response += chunk.text
+                    yield chunk.text
+            
+            # Update history after full generation
+            if full_response.startswith(f"{self.subject}:"):
+                full_response = full_response[len(f"{self.subject}:"):].strip()
+            
+            self.conversation_history.append({
+                'user': user_message,
+                'assistant': full_response
+            })
+            
+            if len(self.conversation_history) > self.max_history:
+                self.conversation_history = self.conversation_history[-self.max_history:]
+                
+        except Exception as e:
+            yield f"Error: {e}"
+
     
     def reset_history(self):
         """Clear the conversation history."""

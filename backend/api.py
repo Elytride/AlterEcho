@@ -855,8 +855,8 @@ def stream_voice_call():
         yield f"data: {json.dumps({'type': 'status', 'content': 'processing'})}\n\n"
         
         try:
-            # Stream text from Gemini
-            for chunk in chatbot.stream_chat(content):
+            # Stream text from Gemini (using voice-optimized prompt)
+            for chunk in chatbot.stream_chat_voice(content):
                 # Send text event
                 yield f"data: {json.dumps({'type': 'text', 'content': chunk})}\n\n"
                 
