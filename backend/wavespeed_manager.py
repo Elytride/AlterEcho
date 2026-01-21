@@ -172,14 +172,7 @@ class WaveSpeedManager:
         
         result = response.json()
         
-        # DEBUG: Save full response to file
-        try:
-            debug_path = Path(__file__).parent / "data" / "debug_wavespeed_clone.json"
-            with open(debug_path, "w", encoding="utf-8") as f:
-                import json
-                json.dump(result, f, indent=2)
-        except Exception as e:
-            logger.error(f"Failed to save debug logs: {e}")
+
         
         # Extract the actual voice_id from WaveSpeed's response
         # The API may assign a different ID than what we requested
@@ -203,12 +196,7 @@ class WaveSpeedManager:
                     
                     if status == "completed":
                         # Success!
-                         # DEBUG: Save completed response
-                        try:
-                            debug_path = Path(__file__).parent / "data" / "debug_wavespeed_clone_completed.json"
-                            with open(debug_path, "w", encoding="utf-8") as f:
-                                json.dump(poll_result, f, indent=2)
-                        except: pass
+ 
 
                         # Extract voice ID from response
                         outputs = poll_data.get("outputs", [])
@@ -226,12 +214,7 @@ class WaveSpeedManager:
                         )
                         break
                     elif status == "failed":
-                        # DEBUG: Save failed response
-                        try:
-                            debug_path = Path(__file__).parent / "data" / "debug_wavespeed_clone_failed.json"
-                            with open(debug_path, "w", encoding="utf-8") as f:
-                                json.dump(poll_result, f, indent=2)
-                        except: pass
+
                         
                         error = poll_data.get("error") or poll_result.get("error", "Unknown error")
                         raise Exception(f"Voice cloning failed: {error}")

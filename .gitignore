@@ -30,13 +30,14 @@ dist-ssr
 # Backend - User data & uploads (generated at runtime)
 backend/uploads/
 backend/preprocessed/
-backend/chats/
+backend/data/chats/
 backend/__pycache__/
 backend/temp_zip/
+backend/data/
 
 # Backend - Credentials & secrets (never commit)
 backend/credentials/
-backend/.secrets/
+backend/data/.secrets/
 
 # Backend - Debug & temporary files
 backend/data/debug_*.json

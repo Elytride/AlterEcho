@@ -60,8 +60,8 @@ app = Flask(__name__)
 CORS(app, origins=["http://localhost:5173", "http://127.0.0.1:5173"])
 
 # --- Configuration & Directories ---
-CHATS_DIR = Path(__file__).parent / "chats"
-CHATS_DIR.mkdir(exist_ok=True)
+CHATS_DIR = Path(__file__).parent / "data" / "chats"
+CHATS_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_TEXT_EXTENSIONS = {'.txt', '.json', '.zip', '.html'}
 

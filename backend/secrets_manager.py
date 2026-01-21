@@ -13,7 +13,7 @@ from typing import Optional
 from cryptography.fernet import Fernet
 
 # Secrets file location (outside of git-tracked folders)
-SECRETS_DIR = Path(__file__).parent / ".secrets"
+SECRETS_DIR = Path(__file__).parent / "data" / ".secrets"
 SECRETS_FILE = SECRETS_DIR / "api_keys.enc"
 
 
@@ -64,7 +64,7 @@ def save_secret(key: str, value: str) -> bool:
         
         # Add to .gitignore if not already there
         gitignore_path = Path(__file__).parent.parent / ".gitignore"
-        gitignore_entry = "backend/.secrets/"
+        gitignore_entry = "backend/data/.secrets/"
         if gitignore_path.exists():
             content = gitignore_path.read_text()
             if gitignore_entry not in content:
