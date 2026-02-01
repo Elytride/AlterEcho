@@ -7,17 +7,17 @@ import os
 import json
 from pathlib import Path
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 # Load environment variables from root folder
 ROOT_DIR = Path(__file__).parent.parent
 load_dotenv(ROOT_DIR / ".env")
 
-# Configure Gemini
-genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+# Configure Gemini - Removed Global Config
 
 
-def generate_embeddings(chunks_path, output_path, batch_size=100, model_name="models/text-embedding-004"):
+def generate_embeddings(chunks_path, output_path, batch_size=100, client=None, model_name="text-embedding-004"):
     """
     Generate embeddings for all context chunks.
     
@@ -25,11 +25,20 @@ def generate_embeddings(chunks_path, output_path, batch_size=100, model_name="mo
         chunks_path: Path to the context chunks JSON file
         output_path: Path to write the embeddings JSON file
         batch_size: Number of chunks to embed in each API call
-        model_name: Name of the embedding model to use (default: models/text-embedding-004)
+        client: Optional genai.Client instance
+        model_name: Name of the embedding model to use
     """
     print(f"\n--- Generating Embeddings ---")
     print(f"  Using model: {model_name}")
     
+    # Initialize client if not provided
+    if not client:
+        api_key = os.getenv('GEMINI_API_KEY')
+        if not api_key:
+            print("Error: GEMINI_API_KEY not found")
+            return
+        client = genai.Client(api_key=api_key)
+
     # Load chunks
     with open(chunks_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -57,12 +66,16 @@ def generate_embeddings(chunks_path, output_path, batch_size=100, model_name="mo
         print(f"  Embedding batch {batch_num}/{total_batches} ({len(batch)} chunks)...")
         
         try:
-            result = genai.embed_content(
+            result = client.models.embed_content(
                 model=model_name,
-                content=batch,
-                task_type="retrieval_document"
+                contents=batch,
+                config=types.EmbedContentConfig(task_type="retrieval_document")
             )
-            all_embeddings.extend(result['embedding'])
+            # Result is EmbedContentResponse, usually has 'embeddings' list of ContentEmbedding
+            # Each ContentEmbedding has 'values' (the vector)
+            # Check structure: result.embeddings[i].values
+            batch_embeddings = [e.values for e in result.embeddings]
+            all_embeddings.extend(batch_embeddings)
         except Exception as e:
             print(f"  Error embedding batch {batch_num}: {e}")
             # Add empty embeddings for failed chunks

@@ -8,14 +8,14 @@ import os
 import re
 from pathlib import Path
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 # Load environment variables from root folder
 ROOT_DIR = Path(__file__).parent.parent
 load_dotenv(ROOT_DIR / ".env")
 
-# Configure Gemini
-genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+# Configure Gemini - Removed Global Config
 
 # Approximate tokens per character (rough heuristic)
 CHARS_PER_TOKEN = 4
@@ -155,7 +155,7 @@ def truncate_section(section_content, percentage):
     return '\n'.join(lines[-keep_count:])
 
 
-def generate_style_summary(style_path, output_path, subject_name, model_name="gemini-3-flash-preview"):
+def generate_style_summary(style_path, output_path, subject_name, client=None, model_name="gemini-2.0-flash"):
     """
     Generate a comprehensive style summary using Gemini.
     
@@ -163,7 +163,8 @@ def generate_style_summary(style_path, output_path, subject_name, model_name="ge
         style_path: Path to the {name}_style.txt file
         output_path: Path to write the output summary
         subject_name: Name of the subject whose style is being analyzed
-        model_name: Name of the Gemini model to use (default: gemini-3-flash-preview)
+        client: Optional genai.Client instance
+        model_name: Name of the Gemini model to use
     """
     print(f"\n--- Generating Style Summary for {subject_name} ---")
     print(f"  Using model: {model_name}")
@@ -178,8 +179,13 @@ def generate_style_summary(style_path, output_path, subject_name, model_name="ge
     sections = parse_style_sections(style_content)
     print(f"  Found {len(sections)} source file section(s)")
     
-    # Initialize Gemini model
-    model = genai.GenerativeModel(model_name)
+    # Initialize Gemini client if not provided
+    if not client:
+        api_key = os.getenv('GEMINI_API_KEY')
+        if not api_key:
+            print("Error: GEMINI_API_KEY not found")
+            return
+        client = genai.Client(api_key=api_key)
     
     # Generate the analysis
     print("  Calling Gemini for style analysis...")
@@ -189,7 +195,10 @@ def generate_style_summary(style_path, output_path, subject_name, model_name="ge
     )
     
     try:
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt
+        )
         analysis = response.text
         print(f"  Analysis generated: {len(analysis):,} characters")
     except Exception as e:

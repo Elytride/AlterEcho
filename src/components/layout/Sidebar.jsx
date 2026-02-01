@@ -18,35 +18,10 @@ import {
     DropdownMenuItem,
     DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import {
-    Collapsible,
-    CollapsibleContent,
-    CollapsibleTrigger,
-} from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
+import { FAQModal } from "@/components/modals/FAQModal";
 
-const FAQ_ITEMS = [
-    {
-        question: "How do I create a new Chat?",
-        answer: "Click the 'New Chat' button at the top. Make sure you've uploaded training data and refreshed AI Memory first."
-    },
-    {
-        question: "What data can I upload?",
-        answer: "Text (chat logs, interviews), Video (vlogs, presentations), and Audio (voice recordings). The AI will analyze all to replicate personality."
-    },
-    {
-        question: "How does the AI learn?",
-        answer: "Upload source materials and click 'Refresh AI Memory'. The system reindexes neural patterns to incorporate new data."
-    },
-    {
-        question: "Can I use Call mode on mobile?",
-        answer: "Yes! Switch to Call mode anytime. Use your device's speaker for voice synthesis and audio input."
-    },
-    {
-        question: "How do I export conversations?",
-        answer: "Long-press on any chat session to access options for export, backup, or archive management."
-    }
-];
+
 
 export function Sidebar({
     sessions,
@@ -166,39 +141,19 @@ export function Sidebar({
                     )}
                 </div>
 
-                {/* FAQ/Guide Section */}
-                <div className="px-2 py-6 border-t border-white/5 mt-4">
-                    <Collapsible open={faqOpen} onOpenChange={setFaqOpen}>
-                        <CollapsibleTrigger asChild>
-                            <button className="w-full flex items-center justify-between p-2 rounded-lg hover:bg-white/5 transition-colors text-muted-foreground hover:text-white">
-                                <div className="flex items-center gap-2">
-                                    <HelpCircle size={16} />
-                                    <span className="text-xs font-medium uppercase tracking-wider">FAQ & Guide</span>
-                                </div>
-                                <ChevronDown size={16} className={cn("transition-transform duration-200", faqOpen && "rotate-180")} />
-                            </button>
-                        </CollapsibleTrigger>
 
-                        <CollapsibleContent className="mt-2 space-y-2">
-                            {FAQ_ITEMS.map((item, idx) => (
-                                <details key={idx} className="group">
-                                    <summary className="cursor-pointer text-xs font-medium text-muted-foreground hover:text-white p-2 rounded-lg hover:bg-white/5 transition-colors list-none">
-                                        <div className="flex items-start gap-2">
-                                            <span className="text-primary mt-0.5">+</span>
-                                            <span className="text-left">{item.question}</span>
-                                        </div>
-                                    </summary>
-                                    <p className="text-[11px] text-muted-foreground/70 p-2 pl-6 leading-relaxed border-l border-white/5 ml-2">
-                                        {item.answer}
-                                    </p>
-                                </details>
-                            ))}
-                        </CollapsibleContent>
-                    </Collapsible>
-                </div>
             </ScrollArea>
 
             <div className="p-4 border-t border-white/5 space-y-2">
+                <Button
+                    variant="ghost"
+                    className="w-full justify-start gap-3 text-muted-foreground hover:text-white hover:bg-white/5"
+                    onClick={() => setFaqOpen(true)}
+                >
+                    <HelpCircle size={18} />
+                    Help & Guide
+                </Button>
+
                 <Button
                     variant="ghost"
                     className="w-full justify-start gap-3 text-muted-foreground hover:text-white hover:bg-white/5"
@@ -207,6 +162,8 @@ export function Sidebar({
                     <Settings size={18} />
                     Settings
                 </Button>
+
+                <FAQModal open={faqOpen} onOpenChange={setFaqOpen} />
             </div>
         </div>
     );

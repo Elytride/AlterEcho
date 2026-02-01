@@ -7,15 +7,16 @@ import os
 import json
 from pathlib import Path
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from context_retriever import ContextRetriever
 
 # Load environment variables from root folder
 ROOT_DIR = Path(__file__).parent.parent
 load_dotenv(ROOT_DIR / ".env")
 
-# Configure Gemini
-genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+# Configure Gemini - Removed Global Config
+
 
 
 class PersonaChatbot:
@@ -23,7 +24,7 @@ class PersonaChatbot:
     A chatbot that replicates a person's talking style with RAG-based knowledge.
     """
     
-    def __init__(self, style_summary_path, embeddings_path, max_history=10, model=None):
+    def __init__(self, style_summary_path, embeddings_path, max_history=10, client=None, model_name="gemini-2.0-flash"):
         """
         Initialize the chatbot.
         
@@ -31,25 +32,31 @@ class PersonaChatbot:
             style_summary_path: Path to the style summary txt file
             embeddings_path: Path to the context embeddings JSON file
             max_history: Maximum number of conversation turns to remember
-            model: Optional pre-configured Gemini model instance
+            client: Optional pre-configured genai.Client instance
+            model_name: Name of the model to use
         """
         # Load style summary
         with open(style_summary_path, 'r', encoding='utf-8') as f:
             self.style_summary = f.read()
+            
+        # Initialize client
+        if client:
+            self.client = client
+        else:
+            api_key = os.getenv('GEMINI_API_KEY')
+            if not api_key:
+                raise ValueError("GEMINI_API_KEY not found")
+            self.client = genai.Client(api_key=api_key)
+            
+        self.model_name = model_name
         
         # Initialize context retriever
-        self.retriever = ContextRetriever(embeddings_path)
+        self.retriever = ContextRetriever(embeddings_path, client=self.client)
         self.subject = self.retriever.subject
         
         # Initialize conversation history
         self.conversation_history = []
         self.max_history = max_history
-        
-        # Initialize Gemini model
-        if model:
-            self.model = model
-        else:
-            self.model = genai.GenerativeModel('gemini-flash-latest')
         
         print(f"Chatbot initialized for {self.subject}")
         print(f"  Style summary: {len(self.style_summary):,} characters")
@@ -130,7 +137,10 @@ User: {user_message}
 Respond as {self.subject}:"""
         
         try:
-            response = self.model.generate_content(full_prompt)
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=full_prompt
+            )
             assistant_message = response.text.strip()
             
             # Clean up the response (remove any accidental prefixes)
@@ -183,7 +193,11 @@ User: {user_message}
 Respond as {self.subject}:"""
             
             # Stream generation
-            response = self.model.generate_content(full_prompt, stream=True)
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=full_prompt,
+                stream=True
+            )
             
             full_response = ""
             for chunk in response:
@@ -274,7 +288,11 @@ User: {user_message}
 Respond as {self.subject} (remember: no emojis, no text symbols, natural speech):"""
             
             # Stream generation
-            response = self.model.generate_content(full_prompt, stream=True)
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=full_prompt,
+                stream=True
+            )
             
             full_response = ""
             for chunk in response:

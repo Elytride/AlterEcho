@@ -22,16 +22,16 @@ from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 
 # --- Google Gemini Integration ---
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 # Load .env from root Nulltale folder
 ROOT_DIR = Path(__file__).parent.parent
 load_dotenv(ROOT_DIR / ".env")
 
 # Configure Gemini
+# In the new SDK, we instantiate a client. We'll do this in get_gemini_model/client.
 GENAI_API_KEY = os.getenv("GEMINI_API_KEY")
-if GENAI_API_KEY:
-    genai.configure(api_key=GENAI_API_KEY)
 
 # --- Import processing modules ---
 from processor import classify_file, extract_participants, generate_style_file, generate_context_chunks, generate_context_file
@@ -103,20 +103,18 @@ def save_settings(new_settings):
     with open(SETTINGS_FILE, "w") as f:
         json.dump(current, f, indent=2)
 
-def get_gemini_model():
+def get_gemini_client():
     global _gemini_model
-    # Always check for fresh key in case it was updated
-    api_key = get_gemini_key()
-    if api_key:
-        genai.configure(api_key=api_key)
+    # Always check for fresh key
+    api_key = get_gemini_key() or os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return None
         
+    return genai.Client(api_key=api_key)
+
+def get_gemini_model_name():
     settings = load_settings()
-    model_name = settings.get("chatbot_model", "gemini-flash-latest")
-    
-    # We re-instantiate if model name changed or first load, 
-    # but for simplicity in this architecture we just create fresh or lazily update.
-    # Since genai.GenerativeModel is lightweight, we can just return a new one configured with the right model.
-    return genai.GenerativeModel(model_name)
+    return settings.get("chatbot_model", "gemini-2.0-flash")
 
 def get_wavespeed_manager(force_reload: bool = False):
     global _wavespeed_manager
@@ -202,11 +200,13 @@ def get_or_create_chatbot(session_id: str):
         return None
         
     try:
-        model = get_gemini_model()
+        client = get_gemini_client()
+        model_name = get_gemini_model_name()
         chatbot = PersonaChatbot(
             str(summary_path),
             str(embeddings_path),
-            model=model
+            client=client,
+            model_name=model_name
         )
         chatbots[session_id] = chatbot
         return chatbot
@@ -674,16 +674,18 @@ def refresh_chat_memory(session_id):
                 settings = load_settings()
                 train_model = settings.get("training_model", "gemini-3-flash-preview")
                 
-                generate_style_summary(str(temp_style), str(summary_path), subject, model_name=train_model)
+                client = get_gemini_client()
+                
+                generate_style_summary(str(temp_style), str(summary_path), subject, client=client, model_name=train_model)
                 
                 # Embeddings
                 yield f"data: {json.dumps({'step': 'embeddings', 'progress': 70, 'message': f'Generating embeddings for {subject}...'})}\n\n"
                 embeddings_path = processed_dir / f"{subject}_embeddings.json"
                 
                 settings = load_settings()
-                embed_model = settings.get("embedding_model", "gemini-embedding-001")
+                embed_model = settings.get("embedding_model", "text-embedding-004")
                 
-                generate_embeddings(str(chunks_path), str(embeddings_path), model_name=embed_model)
+                generate_embeddings(str(chunks_path), str(embeddings_path), client=client, model_name=embed_model)
                 
                 if temp_style.exists(): temp_style.unlink()
             
@@ -890,8 +892,6 @@ def set_gemini_key():
     key = request.json.get("api_key")
     if not key: return jsonify({"error": "No key provided"}), 400
     if save_gemini_key(key):
-        # Configure immediately for this process
-        genai.configure(api_key=key)
         return jsonify({"success": True})
     return jsonify({"error": "Failed to save"}), 500
 

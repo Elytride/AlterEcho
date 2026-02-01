@@ -8,14 +8,14 @@ import json
 import numpy as np
 from pathlib import Path
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 # Load environment variables from root folder
 ROOT_DIR = Path(__file__).parent.parent
 load_dotenv(ROOT_DIR / ".env")
 
-# Configure Gemini
-genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+# Configure Gemini - Removed Global Config
 
 
 def cosine_similarity(vec1, vec2):
@@ -38,13 +38,22 @@ class ContextRetriever:
     Retrieves relevant context chunks based on semantic similarity.
     """
     
-    def __init__(self, embeddings_path):
+    def __init__(self, embeddings_path, client=None):
         """
         Initialize the retriever with pre-computed embeddings.
         
         Args:
             embeddings_path: Path to the embeddings JSON file
+            client: Optional genai.Client instance
         """
+        if client:
+            self.client = client
+        else:
+            api_key = os.getenv('GEMINI_API_KEY')
+            if not api_key:
+                raise ValueError("GEMINI_API_KEY not found")
+            self.client = genai.Client(api_key=api_key)
+            
         with open(embeddings_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         
@@ -73,12 +82,12 @@ class ContextRetriever:
         Returns:
             Embedding vector
         """
-        result = genai.embed_content(
-            model="models/text-embedding-004",
-            content=query,
-            task_type="retrieval_query"
+        result = self.client.models.embed_content(
+            model="text-embedding-004",
+            contents=query,
+            config=types.EmbedContentConfig(task_type="retrieval_query")
         )
-        return np.array(result['embedding'])
+        return np.array(result.embeddings[0].values)
     
     def retrieve(self, query, top_k=5):
         """
