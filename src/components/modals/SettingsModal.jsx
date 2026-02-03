@@ -315,6 +315,15 @@ export function SettingsModal({ open, onOpenChange }) {
                                 onChange={(v) => setSettings(prev => ({ ...prev, embedding_model: v }))}
                                 tooltip="The model used to convert text into vector content for memory retrieval. Changing this requires re-processing memories."
                             />
+
+                            <ModelSelect
+                                label="Image Generation Model"
+                                icon={Eye}
+                                value={settings.image_model || "gemini-2.5-flash-image"}
+                                options={["gemini-2.5-flash-image", "gemini-3-pro-image-preview"]}
+                                onChange={(v) => setSettings(prev => ({ ...prev, image_model: v }))}
+                                tooltip="The model used by the persona to generate images during chat."
+                            />
                         </div>
 
                         {/* General / Danger Zone */}

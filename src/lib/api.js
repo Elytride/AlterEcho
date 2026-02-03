@@ -6,11 +6,26 @@
 const API_BASE = '/api';
 
 // --- Chat ---
-export async function sendMessage(content, sessionId) {
+export async function sendMessage(content, sessionId, file = null) {
+    let body;
+    let headers = {};
+
+    if (file) {
+        const formData = new FormData();
+        formData.append('content', content);
+        formData.append('session_id', sessionId);
+        formData.append('image', file);
+        body = formData;
+        // Content-Type header is set automatically by browser for FormData
+    } else {
+        headers['Content-Type'] = 'application/json';
+        body = JSON.stringify({ content, session_id: sessionId });
+    }
+
     const response = await fetch(`${API_BASE}/chat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content, session_id: sessionId }),
+        headers: headers,
+        body: body,
     });
     if (!response.ok) throw new Error('Failed to send message');
     return response.json();
@@ -120,12 +135,15 @@ export async function checkRefreshReady(sessionId) {
     return response.json();
 }
 
-export async function refreshAIMemory({ sessionId, onProgress, onComplete, onError }) {
+export async function refreshAIMemory({ sessionId, additionalContext, onProgress, onComplete, onError }) {
     try {
         const response = await fetch(`${API_BASE}/chats/${sessionId}/refresh`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_id: sessionId }),
+            body: JSON.stringify({
+                session_id: sessionId,
+                additional_context: additionalContext || ""
+            }),
         });
 
         if (!response.ok) {

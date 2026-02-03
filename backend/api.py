@@ -16,7 +16,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Union
 
-from flask import Flask, request, jsonify, Response, stream_with_context, send_file
+from flask import Flask, request, jsonify, Response, stream_with_context, send_file, send_from_directory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
@@ -90,9 +90,10 @@ def load_settings():
             pass
     # Defaults
     return {
-        "chatbot_model": "gemini-flash-latest",
-        "training_model": "gemini-3-flash-preview",
-        "embedding_model": "gemini-embedding-001"
+        "chatbot_model": "gemini-2.0-flash",
+        "training_model": "gemini-2.0-flash",
+        "embedding_model": "text-embedding-004",
+        "image_model": "gemini-2.0-flash" # Default image model
     }
 
 def save_settings(new_settings):
@@ -168,9 +169,13 @@ def save_message_history(session_id: str, messages: list):
     with open(history_file, "w", encoding="utf-8") as f:
         json.dump(messages, f, indent=2)
 
+# Update get_or_create_chatbot to set image model
 def get_or_create_chatbot(session_id: str):
     """Get existing chatbot or create new one for session."""
     if session_id in chatbots:
+        # Update settings just in case they changed
+        settings = load_settings()
+        chatbots[session_id].set_image_model(settings.get("image_model", "gemini-2.0-flash"))
         return chatbots[session_id]
         
     session_data = load_session_metadata(session_id)
@@ -202,12 +207,15 @@ def get_or_create_chatbot(session_id: str):
     try:
         client = get_gemini_client()
         model_name = get_gemini_model_name()
+        settings = load_settings()
+        
         chatbot = PersonaChatbot(
             str(summary_path),
             str(embeddings_path),
             client=client,
             model_name=model_name
         )
+        chatbot.set_image_model(settings.get("image_model", "gemini-2.0-flash"))
         chatbots[session_id] = chatbot
         return chatbot
     except Exception as e:
@@ -332,6 +340,11 @@ def scan_session_uploads(session_id, file_type):
             print(f"Error scanning file {file_path}: {e}")
     return files
 
+def get_session_images_dir(session_id: str) -> Path:
+    d = get_session_dir(session_id) / "images"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
 # --- API Endpoints: Sessions (CRUD) ---
 
 @app.route("/api/sessions", methods=["GET"])
@@ -369,6 +382,7 @@ def create_session():
     get_session_uploads_dir(session_id, "text").mkdir(parents=True, exist_ok=True)
     get_session_uploads_dir(session_id, "voice").mkdir(parents=True, exist_ok=True)
     get_session_preprocessed_dir(session_id).mkdir(parents=True, exist_ok=True)
+    get_session_images_dir(session_id).mkdir(parents=True, exist_ok=True)
     
     return jsonify(session_data)
 
@@ -610,6 +624,20 @@ def set_chat_file_subject(session_id, file_id):
     
     return jsonify({"success": True, "subject": subject})
 
+@app.route("/api/chats/<session_id>/files/voice/<file_id>/preview", methods=["GET"])
+def preview_voice_file(session_id, file_id):
+    """Serve a voice file for audio preview."""
+    folder = get_session_uploads_dir(session_id, "voice")
+    matches = list(folder.glob(f"{file_id}.*"))
+    # Filter out .meta.json files
+    audio_files = [p for p in matches if not p.name.endswith('.meta.json')]
+    
+    if not audio_files:
+        return jsonify({"error": "Not found"}), 404
+    
+    file_path = audio_files[0]
+    return send_from_directory(file_path.parent, file_path.name)
+
 # --- API Endpoints: Processing & Refresh ---
 
 @app.route("/api/chats/<session_id>/refresh/ready", methods=["GET"])
@@ -628,6 +656,10 @@ def refresh_chat_memory(session_id):
     session_data = load_session_metadata(session_id)
     if not session_data:
         return jsonify({"error": "Session not found"}), 404
+    
+    # Get additional context from request body
+    request_data = request.get_json() or {}
+    additional_context = request_data.get("additional_context", "")
 
     def generate():
         try:
@@ -676,7 +708,7 @@ def refresh_chat_memory(session_id):
                 
                 client = get_gemini_client()
                 
-                generate_style_summary(str(temp_style), str(summary_path), subject, client=client, model_name=train_model)
+                generate_style_summary(str(temp_style), str(summary_path), subject, client=client, model_name=train_model, additional_context=additional_context)
                 
                 # Embeddings
                 yield f"data: {json.dumps({'step': 'embeddings', 'progress': 70, 'message': f'Generating embeddings for {subject}...'})}\n\n"
@@ -744,69 +776,171 @@ def get_session_messages(session_id):
     messages = load_message_history(session_id)
     return jsonify({"messages": messages})
 
+@app.route("/api/chat/<session_id>/images/<filename>", methods=["GET"])
+def get_chat_image(session_id, filename):
+    folder = get_session_images_dir(session_id)
+    return send_file(folder / filename)
+
 @app.route("/api/chat", methods=["POST"])
 def send_message():
-    data = request.json
-    content = data.get("content", "").strip()
-    session_id = data.get("session_id")
+    # Handle multipart/form-data for images
+    content = ""
+    session_id = ""
+    image_file = None
     
-    if not content or not session_id:
-        return jsonify({"error": "Missing content or session_id"}), 400
+    if request.content_type and "multipart/form-data" in request.content_type:
+        content = request.form.get("content", "").strip()
+        session_id = request.form.get("session_id")
+        if "image" in request.files:
+            image_file = request.files["image"]
+    else:
+        # JSON fallback
+        data = request.json
+        content = data.get("content", "").strip()
+        session_id = data.get("session_id")
+    
+    if not session_id:
+        return jsonify({"error": "Missing session_id"}), 400
         
     messages = load_message_history(session_id)
+    images_dir = get_session_images_dir(session_id)
     
-    # User message
-    user_msg = {
+    # Process User Image
+    user_image_path = None
+    user_image_filename = None
+    from PIL import Image # Lazy import
+    import io
+    pil_image = None
+
+    if image_file:
+        file_ext = Path(image_file.filename).suffix
+        if not file_ext: file_ext = ".jpg"
+        user_image_filename = f"user_{uuid.uuid4().hex[:8]}{file_ext}"
+        user_image_path = images_dir / user_image_filename
+        image_file.save(str(user_image_path))
+        
+        # Open for Gemini
+        try:
+            pil_image = Image.open(str(user_image_path))
+        except Exception as e:
+            print(f"Error opening user image: {e}")
+
+    # User message object
+    user_msg_obj = {
         "id": uuid.uuid4().hex[:8],
         "role": "user",
         "content": content,
-        "timestamp": datetime.now().strftime("%I:%M %p")
+        "timestamp": datetime.now().strftime("%I:%M %p"),
+        "images": [f"/api/chat/{session_id}/images/{user_image_filename}"] if user_image_filename else []
     }
-    messages.append(user_msg)
+    messages.append(user_msg_obj)
     
     # Get AI response
     chatbot = get_or_create_chatbot(session_id)
-    ai_content = "I'm not ready yet. Please go to 'Manage' and uploads files, then Refresh Memory."
     
-    if chatbot:
-        try:
-            ai_content = chatbot.chat(content)
-        except Exception as e:
-            ai_content = f"Error: {e}"
+    if not chatbot:
+        return jsonify({
+            "user_message": user_msg_obj,
+            "ai_message": {
+               "id": uuid.uuid4().hex[:8], "role": "assistant", "content": "I'm not ready yet.", "timestamp": ""
+            }
+        })
+
+    # Track user image in chatbot's image history for context
+    if pil_image and user_image_filename:
+        user_img_id = user_image_filename.replace("user_", "").split(".")[0]
+        chatbot.image_history.append({
+            "id": user_img_id,
+            "description": f"Image sent by user with message: {content[:50]}",
+            "source": "user",
+            "pil_image": pil_image  # Keep reference for editing
+        })
+
+    # Call Chatbot with optional image
+    # Note: chatbot.chat() is now synchronous and returns a dict with 'text' and 'images' list
+    response_data = chatbot.chat(content, user_image=pil_image)
+    
+    ai_text = response_data.get("text", "")
+    ai_generated_images = response_data.get("images", []) # list of {id, bytes, prompt}
+    
+    saved_ai_images = []
+    
+    # Save generated images and store PIL data for future editing
+    for img_data in ai_generated_images:
+        img_filename = f"ai_{img_data['id']}.png" # Default to png
+        save_path = images_dir / img_filename
+        
+        with open(save_path, "wb") as f:
+            f.write(img_data["bytes"])
             
-    # Process AI response
-    import re
-    # Split by any newline sequence to treat each line as a potential separate message
-    parts = [p.strip() for p in re.split(r'[\r\n]+', ai_content) if p.strip()]
-    if not parts: parts = [ai_content]
+        saved_ai_images.append(f"/api/chat/{session_id}/images/{img_filename}")
+        
+        # Store PIL image reference for future editing
+        try:
+            pil_ai_image = Image.open(io.BytesIO(img_data["bytes"]))
+            # Find this image in chatbot's history and add PIL reference
+            for img_hist in chatbot.image_history:
+                if img_hist['id'] == img_data['id']:
+                    img_hist['pil_image'] = pil_ai_image
+                    break
+        except Exception as e:
+            print(f"[DEBUG] Could not create PIL image for editing: {e}")
+    
+    # Split AI text into multiple messages by line breaks
+    # This creates the "chat bubble per line" effect
+    # Filter out IMG file attachment lines
+    ai_lines = []
+    for line in ai_text.split('\n'):
+        line = line.strip()
+        if line:
+            # Filter out "IMG-xxx.png (file attached)" type messages
+            if 'IMG-' in line and '(file attached)' in line:
+                continue
+            if line.startswith('IMG-') and '.png' in line:
+                continue
+            ai_lines.append(line)
     
     ai_messages = []
-    ts = datetime.now().strftime("%I:%M %p")
+    timestamp = datetime.now().strftime("%I:%M %p")
     
-    for part in parts:
-        msg = {
-            "id": uuid.uuid4().hex[:8],
-            "role": "assistant",
-            "content": part,
-            "timestamp": ts
-        }
-        messages.append(msg)
-        ai_messages.append(msg)
-        
-    # Update preview
-    if ai_messages:
-        preview = ai_messages[0]["content"]
-        session_data = load_session_metadata(session_id)
-        if session_data:
-            session_data["preview"] = preview[:50] + "..." if len(preview) > 50 else preview
-            save_session_metadata(session_id, session_data)
-            
+    if ai_lines:
+        # First message gets any images
+        for i, line in enumerate(ai_lines):
+            msg = {
+                "id": uuid.uuid4().hex[:8],
+                "role": "assistant",
+                "content": line,
+                "timestamp": timestamp,
+                "images": saved_ai_images if i == 0 else []  # Images only on first message
+            }
+            ai_messages.append(msg)
+            messages.append(msg)
+    else:
+        # If no text but have images, create one message for images
+        if saved_ai_images:
+            msg = {
+                "id": uuid.uuid4().hex[:8],
+                "role": "assistant",
+                "content": "",
+                "timestamp": timestamp,
+                "images": saved_ai_images
+            }
+            ai_messages.append(msg)
+            messages.append(msg)
+    
     save_message_history(session_id, messages)
     
+    # Update preview text
+    session_data = load_session_metadata(session_id)
+    if session_data:
+        preview_text = ai_lines[0] if ai_lines else "[Sent an image]"
+        session_data["preview"] = preview_text[:50] + "..." if len(preview_text) > 50 else preview_text
+        save_session_metadata(session_id, session_data)
+        
     return jsonify({
-        "user_message": user_msg,
-        "ai_message": ai_messages[0],
-        "ai_messages": ai_messages
+        "user_message": user_msg_obj,
+        "ai_message": ai_messages[0] if ai_messages else {"id": "", "role": "assistant", "content": "", "timestamp": "", "images": []},
+        "ai_messages": ai_messages  # Array of all split messages
     })
 
 @app.route("/api/messages/<session_id>", methods=["DELETE"])
@@ -906,77 +1040,113 @@ def warmup():
 
 @app.route("/api/call/stream", methods=["POST"])
 def stream_voice_call():
+    print("\n" + "="*60)
+    print("[VOICE DEBUG] Voice call request received")
+    
     data = request.json
     content = data.get("content", "").strip()
     session_id = data.get("session_id")
     
+    print(f"[VOICE DEBUG] Session ID: {session_id}")
+    print(f"[VOICE DEBUG] Content: '{content[:50]}...' (len={len(content)})")
+    
     if not content or not session_id:
+        print("[VOICE DEBUG] ERROR: Missing content or session_id")
         return jsonify({"error": "Missing content or session_id"}), 400
         
     chatbot = get_or_create_chatbot(session_id)
     if not chatbot:
+        print("[VOICE DEBUG] ERROR: Chatbot not ready")
         return jsonify({"error": "Chatbot not ready. Please refresh memory."}), 400
+    print(f"[VOICE DEBUG] Chatbot ready: {chatbot.subject}")
         
     ws_manager = get_wavespeed_manager()
     if not ws_manager:
+        print("[VOICE DEBUG] ERROR: Voice service (WaveSpeed) not configured")
         return jsonify({"error": "Voice service not configured"}), 400
+    print("[VOICE DEBUG] WaveSpeed manager initialized")
     
     # Get voice ID
     session_data = load_session_metadata(session_id) or {}
     voice_id = session_data.get("wavespeed_voice_id", "Deep_Voice_Man")
+    print(f"[VOICE DEBUG] Voice ID: {voice_id}")
+    
+    # Check voice status
+    voice_created_at = session_data.get("voice_created_at")
+    print(f"[VOICE DEBUG] Voice created at: {voice_created_at}")
+    if voice_created_at:
+        try:
+            from datetime import datetime, timedelta
+            created_dt = datetime.fromisoformat(voice_created_at)
+            days_old = (datetime.now() - created_dt).days
+            print(f"[VOICE DEBUG] Voice age: {days_old} days (expires after 7 days)")
+            if days_old >= 7:
+                print("[VOICE DEBUG] WARNING: Voice may be expired!")
+        except Exception as e:
+            print(f"[VOICE DEBUG] Could not parse voice date: {e}")
     
     def generate():
         import re
         import json
         
+        def clean_for_tts(text):
+            """Clean text for TTS - remove ellipsis, repeated chars, etc."""
+            # Remove ellipsis (... or more dots)
+            text = re.sub(r'\.{2,}', '.', text)
+            # Remove multiple exclamation/question marks
+            text = re.sub(r'!{2,}', '!', text)
+            text = re.sub(r'\?{2,}', '?', text)
+            # Remove asterisk actions like *laughs*
+            text = re.sub(r'\*[^*]+\*', '', text)
+            # Clean up repeated letters (hiiiii -> hii)
+            text = re.sub(r'(.)\1{2,}', r'\1\1', text)
+            # Clean up double spaces
+            text = re.sub(r' {2,}', ' ', text)
+            return text.strip()
+        
         full_response_text = ""
-        buffer = ""
         
         yield f"data: {json.dumps({'type': 'status', 'content': 'processing'})}\n\n"
         
         try:
-            # Stream text from Gemini (using voice-optimized prompt)
-            for chunk in chatbot.stream_chat_voice(content):
-                # Send text event
-                yield f"data: {json.dumps({'type': 'text', 'content': chunk})}\n\n"
-                
-                full_response_text += chunk
-                buffer += chunk
-                
-                # Check for sentence endings
-                parts = re.split(r'([.!?])\s+', buffer)
-                
-                if len(parts) > 1:
-                    num_pairs = (len(parts) - 1) // 2
-                    
-                    for i in range(num_pairs):
-                        sentence = parts[i*2] + parts[i*2+1]
-                        if sentence.strip():
-                            # Generate audio for this sentence
-                            try:
-                                for audio_chunk in ws_manager.speak_stream(sentence, voice_id):
-                                    b64_audio = base64.b64encode(audio_chunk).decode('utf-8')
-                                    yield f"data: {json.dumps({'type': 'audio', 'content': b64_audio, 'index': 0})}\n\n"
-                            except Exception as e:
-                                print(f"TTS Error: {e}")
-                                yield f"data: {json.dumps({'type': 'error', 'content': f'TTS Error: {e}'})}\n\n"
-
-                    buffer = "".join(parts[num_pairs*2:])
+            print("[VOICE DEBUG] Starting stream_chat_voice...")
             
-            # Process remaining buffer
-            if buffer.strip():
-                try:
-                    for audio_chunk in ws_manager.speak_stream(buffer, voice_id):
-                        b64_audio = base64.b64encode(audio_chunk).decode('utf-8')
-                        yield f"data: {json.dumps({'type': 'audio', 'content': b64_audio, 'index': 0})}\n\n"
-                except Exception as e:
-                    print(f"TTS Error: {e}")
-                    yield f"data: {json.dumps({'type': 'error', 'content': f'TTS Error: {e}'})}\n\n"
+            # Collect full response from Gemini (voice call = single complete response)
+            chunk_count = 0
+            for chunk in chatbot.stream_chat_voice(content):
+                chunk_count += 1
+                if chunk_count == 1:
+                    print(f"[VOICE DEBUG] First text chunk received: '{chunk[:50]}...'")
+                # Send text event for UI display
+                yield f"data: {json.dumps({'type': 'text', 'content': chunk})}\n\n"
+                full_response_text += chunk
+            
+            print(f"[VOICE DEBUG] Total text chunks received: {chunk_count}")
+            print(f"[VOICE DEBUG] Full response length: {len(full_response_text)}")
+            
+            if chunk_count == 0:
+                print("[VOICE DEBUG] WARNING: No text chunks from stream_chat_voice!")
+            
+            # Clean and send full response to TTS (no sentence splitting)
+            if full_response_text.strip():
+                clean_text = clean_for_tts(full_response_text)
+                if clean_text:
+                    try:
+                        print(f"[VOICE DEBUG] Sending to TTS (full): '{clean_text[:50]}...'")
+                        for audio_chunk in ws_manager.speak_stream(clean_text, voice_id):
+                            b64_audio = base64.b64encode(audio_chunk).decode('utf-8')
+                            yield f"data: {json.dumps({'type': 'audio', 'content': b64_audio, 'index': 0})}\n\n"
+                    except Exception as e:
+                        print(f"[VOICE DEBUG] TTS Error: {type(e).__name__}: {e}")
+                        yield f"data: {json.dumps({'type': 'error', 'content': f'TTS Error: {e}'})}\n\n"
 
+            print(f"[VOICE DEBUG] Stream complete.")
             yield f"data: {json.dumps({'type': 'done', 'full_text': full_response_text})}\n\n"
 
         except Exception as e:
-            print(f"Stream Error: {e}")
+            print(f"[VOICE DEBUG] Stream Error: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
             yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
 
     return Response(stream_with_context(generate()), mimetype='text/event-stream')

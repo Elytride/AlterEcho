@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { FileText, Mic, Upload, RefreshCw, Check, X, MessageSquare, Instagram, HelpCircle, User, Trash2, AlertCircle, CheckCircle2, Clock, Archive, Users } from "lucide-react";
+import { FileText, Mic, Upload, RefreshCw, Check, X, MessageSquare, Instagram, HelpCircle, User, Trash2, AlertCircle, CheckCircle2, Clock, Archive, Users, Play, Pause } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 import { motion, AnimatePresence } from "framer-motion";
 import { uploadFile, refreshAIMemory, checkRefreshReady, setSubject, deleteUploadedFile, listFiles, cloneVoice, getVoiceStatus, selectZipConversations } from "@/lib/api";
@@ -61,6 +61,13 @@ export function ManageChatModal({ open, onOpenChange, currentSession }) {
     const [pendingZip, setPendingZip] = useState(null); // { zip_id, original_name, conversations }
     const [selectedConversations, setSelectedConversations] = useState([]);
     const [importingZip, setImportingZip] = useState(false);
+
+    // Additional context state
+    const [additionalContext, setAdditionalContext] = useState("");
+
+    // Audio preview state
+    const [playingAudioId, setPlayingAudioId] = useState(null);
+    const audioRef = useRef(null);
 
     const textInputRef = useRef(null);
     const voiceInputRef = useRef(null);
@@ -122,6 +129,33 @@ export function ManageChatModal({ open, onOpenChange, currentSession }) {
         }
     };
 
+    // Audio preview handler
+    const handlePlayAudio = (fileId, filePath) => {
+        if (playingAudioId === fileId) {
+            // Stop playing
+            if (audioRef.current) {
+                audioRef.current.pause();
+                audioRef.current.currentTime = 0;
+            }
+            setPlayingAudioId(null);
+        } else {
+            // Start playing new file
+            if (audioRef.current) {
+                audioRef.current.pause();
+            }
+            const audioUrl = `http://localhost:5000/api/chats/${sessionId}/files/voice/${fileId}/preview`;
+            const audio = new Audio(audioUrl);
+            audio.onended = () => setPlayingAudioId(null);
+            audio.onerror = () => {
+                console.error("Audio playback error");
+                setPlayingAudioId(null);
+            };
+            audioRef.current = audio;
+            audio.play();
+            setPlayingAudioId(fileId);
+        }
+    };
+
     const handleRefresh = async () => {
         if (!sessionId) return;
         setIsRefreshing(true);
@@ -131,6 +165,7 @@ export function ManageChatModal({ open, onOpenChange, currentSession }) {
 
         await refreshAIMemory({
             sessionId: sessionId,
+            additionalContext: additionalContext,
             onProgress: (data) => {
                 setProgress(Math.round(data.progress));
                 setProgressMessage(data.message);
@@ -611,8 +646,10 @@ export function ManageChatModal({ open, onOpenChange, currentSession }) {
                             <div className="space-y-3 pt-2">
                                 <Label className="text-xs text-muted-foreground">Additional Context</Label>
                                 <Textarea
-                                    placeholder="Enter specific personality traits, key memories, or behavioral quirks here..."
+                                    placeholder="Enter information about subject (e.g. personality traits, key memories or behavioral quirks)"
                                     className="bg-white/5 border-white/10 focus-visible:ring-primary min-h-[80px] text-sm"
+                                    value={additionalContext}
+                                    onChange={(e) => setAdditionalContext(e.target.value)}
                                 />
                             </div>
                         </div>
@@ -722,7 +759,16 @@ export function ManageChatModal({ open, onOpenChange, currentSession }) {
                                             <Button
                                                 variant="ghost"
                                                 size="icon"
-                                                className="h-6 w-6 text-muted-foreground hover:text-red-400 ml-2"
+                                                className="h-6 w-6 text-muted-foreground hover:text-purple-400"
+                                                onClick={() => handlePlayAudio(file.id)}
+                                                title={playingAudioId === file.id ? "Stop" : "Play preview"}
+                                            >
+                                                {playingAudioId === file.id ? <Pause size={14} /> : <Play size={14} />}
+                                            </Button>
+                                            <Button
+                                                variant="ghost"
+                                                size="icon"
+                                                className="h-6 w-6 text-muted-foreground hover:text-red-400"
                                                 onClick={() => handleDeleteFile('voice', file.id)}
                                             >
                                                 <Trash2 size={14} />

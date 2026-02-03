@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Send, Paperclip, Mic, User, Phone, PhoneOff, Volume2, Eye, Trash2 } from "lucide-react";
+import { Send, Paperclip, Mic, User, Phone, PhoneOff, Volume2, Eye, Trash2, Image as ImageIcon, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { motion, AnimatePresence } from "framer-motion";
 import { sendMessage, getMessages, streamVoiceCall, warmupModels, clearChatHistory } from "@/lib/api";
@@ -10,11 +10,13 @@ import { sendMessage, getMessages, streamVoiceCall, warmupModels, clearChatHisto
 export function ChatInterface({ sessionId = "1", sessionName = "Alan Turing" }) {
     const [messages, setMessages] = useState([]);
     const [input, setInput] = useState("");
+    const [attachment, setAttachment] = useState(null); // New attachment state
     const [mode, setMode] = useState("text");
     const [isCallActive, setIsCallActive] = useState(false);
     const [callDuration, setCallDuration] = useState(0);
     const [isLoading, setIsLoading] = useState(false);
     const [isListening, setIsListening] = useState(false);
+    const [isDragging, setIsDragging] = useState(false); // Drag state
     const scrollRef = useRef(null);
     const fileInputRef = useRef(null);
     const audioContextRef = useRef(null);
@@ -49,34 +51,46 @@ export function ChatInterface({ sessionId = "1", sessionName = "Alan Turing" }) 
     };
 
     const handleSend = async () => {
-
-        if (!input.trim() || isLoading) return;
+        if ((!input.trim() && !attachment) || isLoading) return;
 
         const userContent = input;
+        const currentAttachment = attachment;
+
         setInput("");
+        setAttachment(null);
         setIsLoading(true);
 
-        // Optimistic update - add user message immediately
+        const tempId = `temp-${Date.now()}`;
+
+        // Convert attachment to URL for optimistic preview
+        let optimisticImages = [];
+        if (currentAttachment) {
+            optimisticImages = [URL.createObjectURL(currentAttachment)];
+        }
+
+        // Optimistic update
         const tempUserMsg = {
-            id: `temp-${Date.now()}`,
+            id: tempId,
             role: "user",
             content: userContent,
+            images: optimisticImages,
             timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
         };
         setMessages(prev => [...prev, tempUserMsg]);
 
         try {
-            const response = await sendMessage(userContent, sessionId);
+            // Pass attachment to sendMessage
+            const response = await sendMessage(userContent, sessionId, currentAttachment);
+
             // Replace temp message with real ones
             setMessages(prev => {
-                const filtered = prev.filter(m => m.id !== tempUserMsg.id);
+                const filtered = prev.filter(m => m.id !== tempId);
                 // Use ai_messages array if available, otherwise use single ai_message
                 const aiMessages = response.ai_messages || [response.ai_message];
                 return [...filtered, response.user_message, ...aiMessages];
             });
         } catch (error) {
             console.error("Failed to send message:", error);
-            // Keep the temp message but show error
             setMessages(prev => [...prev, {
                 id: Date.now() + 1,
                 role: "assistant",
@@ -92,20 +106,50 @@ export function ChatInterface({ sessionId = "1", sessionName = "Alan Turing" }) 
         fileInputRef.current?.click();
     };
 
-    const handleFileSelect = async (e) => {
+    const handleFileSelect = (e) => {
         const file = e.target.files?.[0];
-        if (!file) return;
-
-        // Add a message about the attached file
-        setMessages(prev => [...prev, {
-            id: Date.now(),
-            role: "user",
-            content: `📎 Attached: ${file.name}`,
-            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-        }]);
-
-        // Reset input
+        if (file) {
+            setAttachment(file);
+        }
+        // Format input value so changes trigger even if same file
         e.target.value = '';
+    };
+
+    // Drag and Drop Handlers
+    const onDragOver = (e) => {
+        e.preventDefault();
+        setIsDragging(true);
+    };
+
+    const onDragLeave = (e) => {
+        e.preventDefault();
+        setIsDragging(false);
+    };
+
+    const onDrop = (e) => {
+        e.preventDefault();
+        setIsDragging(false);
+        const files = e.dataTransfer.files;
+        if (files && files[0]) {
+            if (files[0].type.startsWith("image/")) {
+                setAttachment(files[0]);
+            } else {
+                alert("Only images are supported for direct chat attachment currently.");
+            }
+        }
+    };
+
+    // Paste Handler
+    const handlePaste = (e) => {
+        const items = e.clipboardData.items;
+        for (let i = 0; i < items.length; i++) {
+            if (items[i].type.indexOf("image") !== -1) {
+                const blob = items[i].getAsFile();
+                setAttachment(blob);
+                e.preventDefault(); // Prevent standard paste if it was an image
+                break;
+            }
+        }
     };
 
     const handleMicClick = () => {
@@ -359,14 +403,36 @@ export function ChatInterface({ sessionId = "1", sessionName = "Alan Turing" }) 
     }, []);
 
     return (
-        <div className="flex-1 flex flex-col h-full bg-background relative overflow-hidden">
+        <div
+            className="flex-1 flex flex-col h-full bg-background relative overflow-hidden"
+            onDragOver={onDragOver}
+            onDragLeave={onDragLeave}
+            onDrop={onDrop}
+        >
+            {/* Drag Overlay */}
+            <AnimatePresence>
+                {isDragging && (
+                    <motion.div
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        exit={{ opacity: 0 }}
+                        className="absolute inset-0 z-50 bg-primary/20 backdrop-blur-sm border-2 border-dashed border-primary flex items-center justify-center pointer-events-none"
+                    >
+                        <div className="flex flex-col items-center text-primary font-display animate-bounce">
+                            <ImageIcon size={48} className="mb-4" />
+                            <h3 className="text-2xl font-bold">Drop image to attach</h3>
+                        </div>
+                    </motion.div>
+                )}
+            </AnimatePresence>
+
             {/* Hidden file input */}
             <input
                 type="file"
                 ref={fileInputRef}
                 onChange={handleFileSelect}
                 className="hidden"
-                accept=".txt,.pdf,.json,.doc,.docx"
+                accept="image/*"
             />
 
             {/* Background Ambience */}
@@ -450,7 +516,7 @@ export function ChatInterface({ sessionId = "1", sessionName = "Alan Turing" }) 
                                         </div>
                                         <h3 className="text-lg font-medium text-white mb-2">Start a conversation</h3>
                                         <p className="text-sm text-muted-foreground max-w-xs">
-                                            Type a message below to begin chatting. Make sure you've uploaded chat files and refreshed AI Memory first.
+                                            Type a message below to begin chatting. Drag & drop images to share them with the persona.
                                         </p>
                                     </div>
                                 )}
@@ -475,6 +541,20 @@ export function ChatInterface({ sessionId = "1", sessionName = "Alan Turing" }) 
                                                 ? "bg-white/5 border border-white/5 text-gray-200 rounded-tl-none"
                                                 : "bg-primary text-white shadow-lg shadow-primary/20 rounded-tr-none"
                                         )}>
+                                            {/* Render Images if present */}
+                                            {msg.images && msg.images.length > 0 && (
+                                                <div className="mb-2 space-y-2">
+                                                    {msg.images.map((imgSrc, idx) => (
+                                                        <img
+                                                            key={idx}
+                                                            src={imgSrc}
+                                                            alt="attached content"
+                                                            className="rounded-lg max-w-full max-h-[300px] object-cover border border-white/10"
+                                                        />
+                                                    ))}
+                                                </div>
+                                            )}
+
                                             <span className="whitespace-pre-wrap">{msg.content}</span>
                                             <div className={cn(
                                                 "text-[8px] sm:text-[10px] mt-2 opacity-50",
@@ -506,45 +586,71 @@ export function ChatInterface({ sessionId = "1", sessionName = "Alan Turing" }) 
                         <div className="p-3 sm:p-6 pb-6 sm:pb-8">
                             <div className="max-w-2xl sm:max-w-3xl mx-auto relative group">
                                 <div className="absolute -inset-0.5 bg-gradient-to-r from-primary/20 to-blue-500/20 rounded-lg sm:rounded-2xl blur opacity-20 group-hover:opacity-40 transition duration-500" />
-                                <div className="relative bg-sidebar border border-white/10 rounded-lg sm:rounded-2xl p-1.5 sm:p-2 flex items-center gap-1 sm:gap-2 shadow-2xl">
-                                    <Button
-                                        variant="ghost"
-                                        size="icon"
-                                        className="h-8 w-8 sm:h-10 sm:w-10 text-muted-foreground hover:text-white shrink-0 text-xs sm:text-base"
-                                        onClick={handleAttachment}
-                                    >
-                                        <Paperclip size={16} className="sm:size-[20px]" />
-                                    </Button>
+                                <div className="relative bg-sidebar border border-white/10 rounded-lg sm:rounded-2xl shadow-2xl overflow-hidden">
 
-                                    <Input
-                                        value={input}
-                                        onChange={(e) => setInput(e.target.value)}
-                                        onKeyDown={(e) => e.key === "Enter" && handleSend()}
-                                        placeholder="Message..."
-                                        className="flex-1 bg-transparent border-none focus-visible:ring-0 text-white placeholder:text-muted-foreground/50 h-10 sm:h-12 text-xs sm:text-base"
-                                        disabled={isLoading}
-                                    />
+                                    {/* Attachment Preview */}
+                                    {attachment && (
+                                        <div className="px-4 py-2 bg-white/5 border-b border-white/5 flex items-center justify-between">
+                                            <div className="flex items-center gap-2 overflow-hidden">
+                                                <ImageIcon size={16} className="text-primary shrink-0" />
+                                                <span className="text-xs text-muted-foreground truncate max-w-[200px]">{attachment.name}</span>
+                                            </div>
+                                            <Button
+                                                variant="ghost"
+                                                size="icon"
+                                                className="h-6 w-6 text-muted-foreground hover:text-white"
+                                                onClick={() => setAttachment(null)}
+                                            >
+                                                <X size={14} />
+                                            </Button>
+                                        </div>
+                                    )}
 
-                                    <Button
-                                        variant="ghost"
-                                        size="icon"
-                                        className={cn(
-                                            "h-8 w-8 sm:h-10 sm:w-10 shrink-0 text-xs sm:text-base transition-colors",
-                                            isListening ? "text-red-500 animate-pulse" : "text-muted-foreground hover:text-white"
-                                        )}
-                                        onClick={handleMicClick}
-                                    >
-                                        <Mic size={16} className="sm:size-[20px]" />
-                                    </Button>
+                                    <div className="p-1.5 sm:p-2 flex items-center gap-1 sm:gap-2">
+                                        <Button
+                                            variant="ghost"
+                                            size="icon"
+                                            className={cn(
+                                                "h-8 w-8 sm:h-10 sm:w-10 shrink-0 text-xs sm:text-base transition-colors",
+                                                attachment ? "text-primary" : "text-muted-foreground hover:text-white"
+                                            )}
+                                            onClick={handleAttachment}
+                                            title="Attach image"
+                                        >
+                                            <Paperclip size={16} className="sm:size-[20px]" />
+                                        </Button>
 
-                                    <Button
-                                        onClick={handleSend}
-                                        size="icon"
-                                        className="bg-primary hover:bg-primary/90 text-white rounded-lg sm:rounded-xl shrink-0 h-8 w-8 sm:h-10 sm:w-10 shadow-[0_0_15px_rgba(124,58,237,0.3)]"
-                                        disabled={isLoading || !input.trim()}
-                                    >
-                                        <Send size={14} className="sm:size-[18px]" />
-                                    </Button>
+                                        <Input
+                                            value={input}
+                                            onChange={(e) => setInput(e.target.value)}
+                                            onKeyDown={(e) => e.key === "Enter" && handleSend()}
+                                            onPaste={handlePaste}
+                                            placeholder="Message... (Paste images supported)"
+                                            className="flex-1 bg-transparent border-none focus-visible:ring-0 text-white placeholder:text-muted-foreground/50 h-10 sm:h-12 text-xs sm:text-base"
+                                            disabled={isLoading}
+                                        />
+
+                                        <Button
+                                            variant="ghost"
+                                            size="icon"
+                                            className={cn(
+                                                "h-8 w-8 sm:h-10 sm:w-10 shrink-0 text-xs sm:text-base transition-colors",
+                                                isListening ? "text-red-500 animate-pulse" : "text-muted-foreground hover:text-white"
+                                            )}
+                                            onClick={handleMicClick}
+                                        >
+                                            <Mic size={16} className="sm:size-[20px]" />
+                                        </Button>
+
+                                        <Button
+                                            onClick={handleSend}
+                                            size="icon"
+                                            className="bg-primary hover:bg-primary/90 text-white rounded-lg sm:rounded-xl shrink-0 h-8 w-8 sm:h-10 sm:w-10 shadow-[0_0_15px_rgba(124,58,237,0.3)]"
+                                            disabled={isLoading || (!input.trim() && !attachment)}
+                                        >
+                                            <Send size={14} className="sm:size-[18px]" />
+                                        </Button>
+                                    </div>
                                 </div>
                                 <div className="text-center mt-2 sm:mt-3 text-[8px] sm:text-xs text-muted-foreground/40 font-mono hidden sm:block">
                                     NULLTALE ENGINE ACTIVE // ENCRYPTION ENABLED

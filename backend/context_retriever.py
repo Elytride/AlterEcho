@@ -82,12 +82,18 @@ class ContextRetriever:
         Returns:
             Embedding vector
         """
+        # Use the same model that created the stored embeddings
+        print(f"[EMBEDDING DEBUG] Using model: {self.embedding_model}")
         result = self.client.models.embed_content(
-            model="text-embedding-004",
+            model=self.embedding_model,
             contents=query,
             config=types.EmbedContentConfig(task_type="retrieval_query")
         )
-        return np.array(result.embeddings[0].values)
+        query_embedding = np.array(result.embeddings[0].values)
+        print(f"[EMBEDDING DEBUG] Query embedding shape: {query_embedding.shape}")
+        if self.embeddings:
+            print(f"[EMBEDDING DEBUG] Stored embedding shape: {self.embeddings[0].shape}")
+        return query_embedding
     
     def retrieve(self, query, top_k=5):
         """
