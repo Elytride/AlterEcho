@@ -77,7 +77,7 @@ The frontend is a modern React application built with Vite.
 
 ## Powered by Gemini
 
-AlterEcho relies heavily on the **Gemini Ecosystem** (specifically Gemini 2.0 Flash) to power every aspect of the pipeline. It uses advanced features to create a truly lifelike persona:
+AlterEcho relies heavily on the **Gemini Ecosystem** to power every aspect of the pipeline. It uses advanced features to create a truly lifelike persona:
 
 ### 1. Style Hyper-Profiling (Long Context)
 We leverage Gemini's massive context window to feed *thousands* of chat messages into a single prompt.
@@ -105,4 +105,4 @@ For the voice feature (`StreamChat`), speed is critical.
 ## Tech Stack
 -   **Frontend**: React, TailwindCSS v4, Radix UI, Framer Motion
 -   **Backend**: Python, Flask
--   **AI**: Google Gemini 2.0 Flash (Logic/Text), WaveSpeed MiniMax (Voice)
+-   **AI**: Google Gemini (Logic/Text), WaveSpeed MiniMax (Voice)
