@@ -6,11 +6,12 @@
 
 ## Features
 
--   **Linguistic Style Analysis**: Mathematically deconstructs chat logs to replicate vocabulary, sarcasm patterns, and emotional tone.
+-   **Linguistic Style Hyper-Profiling**: Mathematically deconstructs chat logs to replicate vocabulary, sarcasm patterns, and emotional tone using Gemini's massive context window.
 -   **Voice Cloning**: Integrates WaveSpeed MiniMax 2.6 Turbo for high-fidelity voice synthesis.
 -   **Multi-Source Import**: Supports Instagram (`.json`) and Discord (`.zip`) chat exports.
 -   **Hybrid Memory**: Combines static style guides with RAG (Retrieval Augmented Generation) for accurate long-term memory.
--   **Local-First**: Data stays on your machine (`backend/data/`).
+-   **Local-First Architecture**: Your data stays on your machine.
+-   **Multimodal Interaction**: Send images to the persona and have them react in-character.
 
 ---
 
@@ -33,19 +34,40 @@ cd AlterEcho
 ### 2. Backend Setup
 The backend runs on Flask and handles all AI processing.
 
+#### Windows (PowerShell)
+1.  Navigate to the backend folder:
+    ```powershell
+    cd backend
+    ```
+2.  Install Python dependencies:
+    ```powershell
+    pip install -r requirements.txt
+    ```
+3.  Run the server:
+    ```powershell
+    python api.py
+    ```
+
+#### MacOS / Linux (Bash/Zsh)
 1.  Navigate to the backend folder:
     ```bash
     cd backend
     ```
-2.  Install python dependencies:
+2.  Create and activate a virtual environment (optional but recommended):
+    ```bash
+    python3 -m venv venv
+    source venv/bin/activate
+    ```
+3.  Install Python dependencies:
     ```bash
     pip install -r requirements.txt
     ```
-3.  Run the server:
+4.  Run the server:
     ```bash
-    python api.py
+    python3 api.py
     ```
-    *The server will start on `http://localhost:5000`.*
+
+*The server will start on `http://localhost:5000`.*
 
 ### 3. Frontend Setup
 The frontend is a modern React application built with Vite.
@@ -74,7 +96,7 @@ AlterEcho relies heavily on the **Gemini Ecosystem** to power every aspect of th
 We leverage Gemini's massive context window to feed *thousands* of chat messages into a single prompt.
 *   **The Task**: Sort, organize, and analyze raw unstructured chat formats (Instagram/Discord).
 *   **The Output**: A rigorous "Linguistic Style Guide" that deconstructs the user's vocabulary, sarcasm patterns, emoji usage, and emotional baselines.
-*   *Why Gemini?*: Its ability to hold the entire history in context allows it to find subtle patterns that RAG chunks would miss.
+*   **Why Gemini?**: Its ability to hold the entire history in context allows it to find subtle patterns that RAG chunks would miss.
 
 ### 2. Native Function Calling
 The chatbot isn't just text. It uses **Gemini Function Calling** to autonomously interact with the world.
@@ -94,6 +116,6 @@ For the voice feature (`StreamChat`), speed is critical.
 ---
 
 ## Tech Stack
--   **Frontend**: React, TailwindCSS v4, Radix UI, Framer Motion
--   **Backend**: Python, Flask
--   **AI**: Google Gemini (Logic/Text), WaveSpeed MiniMax (Voice)
+-   **Frontend**: React 19, TailwindCSS v4, Radix UI, Framer Motion
+-   **Backend**: Python 3.10+, Flask
+-   **AI**: Google Gemini (Logic/Text/Vision), WaveSpeed MiniMax (Voice)
