@@ -75,6 +75,33 @@ The frontend is a modern React application built with Vite.
 
 ---
 
+## Powered by Gemini
+
+AlterEcho relies heavily on the **Gemini Ecosystem** (specifically Gemini 2.0 Flash) to power every aspect of the pipeline. It uses advanced features to create a truly lifelike persona:
+
+### 1. Style Hyper-Profiling (Long Context)
+We leverage Gemini's massive context window to feed *thousands* of chat messages into a single prompt.
+*   **The Task**: Sort, organize, and analyze raw unstructured chat formats (Instagram/Discord).
+*   **The Output**: A rigorous "Linguistic Style Guide" that deconstructs the user's vocabulary, sarcasm patterns, emoji usage, and emotional baselines.
+*   *Why Gemini?*: Its ability to hold the entire history in context allows it to find subtle patterns that RAG chunks would miss.
+
+### 2. Native Function Calling
+The chatbot isn't just text. It uses **Gemini Function Calling** to autonomously interact with the world.
+*   **Tools**: We define tools like `generate_or_edit_image`.
+*   **Autonomy**: Users don't need to type special commands. If you say *"Send me a selfie"* or *"Make that picture darker"*, Gemini understands the intent ("Is this a tool call?") and executes the function naturally.
+
+### 3. Multimodal Vision
+AlterEcho can **see**.
+*   **Visual Understanding**: You can upload images to the chat, and Gemini will analyze them and react in character (e.g., *"Omg that cat is so cute!!"* or *"Where did you buy those shoes??"*).
+*   **Image Editing**: It maintains an "Image History", allowing it to reference, understand, and even *edit* previous images in the conversation multimodally.
+
+### 4. Low-Latency Streaming
+For the voice feature (`StreamChat`), speed is critical.
+*   **Architecture**: We use `generate_content_stream` to get token-by-token output.
+*   **Pipeline**: As soon as Gemini generates the first few words, they are cleaned and piped directly into the WaveSpeed TTS engine. This results in a near-instant conversational flow that feels like a real phone call.
+
+---
+
 ## Tech Stack
 -   **Frontend**: React, TailwindCSS v4, Radix UI, Framer Motion
 -   **Backend**: Python, Flask
