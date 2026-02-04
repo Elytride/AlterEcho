@@ -4,8 +4,6 @@
 
 **AlterEcho** is a digital persona system that allows you to "resurrect" or clone digital personalities from chat history and voice samples. By analyzing linguistic patterns from Instagram/Discord logs and cloning voice profiles using WaveSpeed, AlterEcho creates a hyper-realistic AI companion that speaks and texts exactly like the original person.
 
-![AlterEcho Interface](public/vite.svg)
-
 ## Features
 
 -   **Linguistic Style Analysis**: Mathematically deconstructs chat logs to replicate vocabulary, sarcasm patterns, and emotional tone.
